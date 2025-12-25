@@ -203,6 +203,56 @@ static std::vector<double> parse_comma_doubles(const std::string &s) {
     return out;
 }
 
+// Parse bounds given in several convenient formats:
+// 1) "min1,min2,...;max1,max2,..."  (semicolon separates mins and maxs)
+// 2) "min1:max1,min2:max2,..."      (per-dimension pairs)
+// 3) "min:max"                       (1D shorthand)
+static bool parse_bounds_string(const std::string &s, std::vector<double> &mins, std::vector<double> &maxs) {
+    mins.clear(); maxs.clear();
+    // Case 1: semicolon-separated mins and maxs
+    auto pos = s.find(';');
+    if (pos != std::string::npos) {
+        std::string left = s.substr(0, pos);
+        std::string right = s.substr(pos+1);
+        auto l = parse_comma_doubles(left);
+        auto r = parse_comma_doubles(right);
+        if (l.empty() || r.empty()) return false;
+        mins = l; maxs = r;
+        return true;
+    }
+
+    // Case 2: comma-separated per-dimension pairs using ':'
+    // e.g. "0:1,0:2"
+    bool has_colon = (s.find(':') != std::string::npos);
+    if (has_colon) {
+        std::istringstream iss(s);
+        std::string part;
+        while (std::getline(iss, part, ',')) {
+            auto p = part.find(':');
+            if (p == std::string::npos) return false;
+            try {
+                double a = std::stod(part.substr(0, p));
+                double b = std::stod(part.substr(p+1));
+                mins.push_back(a);
+                maxs.push_back(b);
+            } catch (...) { return false; }
+        }
+        if (mins.empty() || maxs.empty()) return false;
+        return true;
+    }
+
+    // Case 3: simple two numbers (min:max or min,max) for 1D
+    auto parts = parse_comma_doubles(s);
+    if (parts.size() == 2) {
+        mins.push_back(parts[0]);
+        maxs.push_back(parts[1]);
+        return true;
+    }
+
+    // Couldn't parse
+    return false;
+}
+
 int main(int argc, char** argv) {
     std::cout << "================================================================\n";
     std::cout << "  OPTIMIZED MIXED PRECISION MONTE CARLO INTEGRATION\n";
@@ -240,13 +290,26 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--expr" && i+1 < argc) { expr = argv[++i]; }
+        else if (a == "--func" && i+1 < argc) { expr = argv[++i]; }
         else if (a == "--samples" && i+1 < argc) { total_samples = std::stoull(argv[++i]); }
+        else if (a == "--sample" && i+1 < argc) { total_samples = std::stoull(argv[++i]); }
+        else if (a == "--bounds" && i+1 < argc) {
+            std::string s = argv[++i];
+            std::vector<double> mins, maxs;
+            if (!parse_bounds_string(s, mins, maxs)) {
+                std::cerr << "Error: could not parse --bounds value. Use formats like 'min1,min2;max1,max2' or 'min1:max1,min2:max2' or 'min:max'\n";
+                return EXIT_FAILURE;
+            }
+            bounds_min = mins;
+            bounds_max = maxs;
+        }
         else if (a == "--bounds-min" && i+1 < argc) { bounds_min = parse_comma_doubles(argv[++i]); }
         else if (a == "--bounds-max" && i+1 < argc) { bounds_max = parse_comma_doubles(argv[++i]); }
         else if (a == "--dims" && i+1 < argc) { explicit_dims = std::stoi(argv[++i]); }
         else if (a == "--tolerance" && i+1 < argc) { tolerance = std::stod(argv[++i]); }
         else if (a == "--help" || a == "-h") {
-            std::cout << "Usage: ./mci [--expr \"EXPR\"] [--samples N] [--bounds-min a,b,...] [--bounds-max a,b,...] [--dims D] [--tolerance T]\n";
+            std::cout << "Usage: ./mci_optimized --func \"FUNC\" --bounds \"min1:max1,min2:max2\" --sample N [--dims D] [--tolerance T]\n";
+            std::cout << "Alternate (backwards compatible): --expr, --samples, --bounds-min, --bounds-max\n";
             return EXIT_SUCCESS;
         }
     }
@@ -258,6 +321,9 @@ int main(int argc, char** argv) {
 
     if (bounds_min.empty()) bounds_min.assign(dims, 0.0);
     if (bounds_max.empty()) bounds_max.assign(dims, 1.0);
+
+    if (bounds_min.size() == 1 && dims > 1) bounds_min.assign(dims, bounds_min[0]);
+    if (bounds_max.size() == 1 && dims > 1) bounds_max.assign(dims, bounds_max[0]);
 
     if ((int)bounds_min.size() != dims || (int)bounds_max.size() != dims) {
         std::cerr << "Error: bounds size does not match detected/explicit dims (" << dims << ").\n";

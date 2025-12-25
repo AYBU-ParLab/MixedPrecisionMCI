@@ -344,7 +344,6 @@ inline Precision select_precision_fast(
         }
     }
     
-    // 7. FALLBACK - ERROR ANALYSIS
     const long double eps_h = 4.88e-4L;  // FP16: 2^-11
     const long double eps_f = std::numeric_limits<float>::epsilon();
     const long double eps_d = std::numeric_limits<double>::epsilon();
@@ -366,15 +365,12 @@ inline Precision select_precision_fast(
     double safety_factor = termwise ? 5.0 : 1.0;  // Balanced safety
 
     if (err_h <= tol / safety_factor) {
-        std::cout << "  [" << name << "] Error analysis -> FP16 (err=" << err_h << ")\n";
         return Precision::Half;
     }
     if (err_f <= tol / safety_factor) {
-        std::cout << "  [" << name << "] Error analysis -> FP32 (err=" << err_f << ")\n";
         return Precision::Float;
     }
     if (err_d <= tol / safety_factor) {
-        std::cout << "  [" << name << "] Error analysis -> FP64 (err=" << err_d << ")\n";
         return Precision::Double;
     }
     
