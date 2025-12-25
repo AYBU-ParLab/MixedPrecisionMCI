@@ -1,56 +1,42 @@
-
 #include "parser.h"
-#include <cmath>
-#include <stack>
-#include <iostream>
-#include <stdexcept>
-#include <cuda_runtime.h>
-
-Token::Token(TokenType t, const std::string& v) : type(t), value(v) {}
-// Helper function for CUDA error checking
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t error = call; \
-        if (error != cudaSuccess) { \
-            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << " - " \
-                      << cudaGetErrorString(error) << std::endl; \
-            exit(EXIT_FAILURE); \
-        } \
-    } while(0)
+#include <cctype>
+#include <algorithm>
 
 std::vector<Token> tokenize(const std::string& expr) {
     std::vector<Token> tokens;
     size_t i = 0;
+    
     while (i < expr.length()) {
         char c = expr[i];
-
+        
         if (isspace(c)) { ++i; continue; }
-
+        
         if (isdigit(c) || c == '.') {
             std::string num;
-            while (i < expr.length() && (isdigit(expr[i]) || expr[i] == '.')) num += expr[i++];
+            while (i < expr.length() && (isdigit(expr[i]) || expr[i] == '.' || 
+                   expr[i] == 'e' || expr[i] == 'E' || 
+                   (i > 0 && (expr[i-1] == 'e' || expr[i-1] == 'E') && 
+                   (expr[i] == '+' || expr[i] == '-')))) {
+                num += expr[i++];
+            }
             tokens.emplace_back(TokenType::Number, num);
         }
         else if (isalpha(c)) {
             std::string name;
             while (i < expr.length() && isalpha(expr[i])) name += expr[i++];
-            if (name == "sin" || name == "cos" || name == "log" || name == "ln" || name == "exp" || name == "sqrt")
+            
+            if (name == "sin" || name == "cos" || name == "log" || name == "ln" || 
+                name == "exp" || name == "sqrt" || name == "tan" || name == "abs")
                 tokens.emplace_back(TokenType::Function, name);
             else
                 tokens.emplace_back(TokenType::Variable, name);
         }
         else if (std::string("+-*/^").find(c) != std::string::npos) {
-            // Handle unary minus/plus
             if ((c == '-' || c == '+') && (i == 0 || 
                 (i > 0 && (expr[i-1] == '(' || 
                  std::string("+-*/^").find(expr[i-1]) != std::string::npos)))) {
-                
                 if (c == '-') {
-                    // Insert 0 before unary minus to handle it as binary operation (0-x)
                     tokens.emplace_back(TokenType::Number, "0");
-                }
-                // For unary plus, we can just skip it
-                if (c == '-') {
                     tokens.emplace_back(TokenType::Operator, std::string(1, c));
                 }
             } else {
@@ -70,7 +56,7 @@ std::vector<Token> tokenize(const std::string& expr) {
             throw std::runtime_error(std::string("Invalid character: ") + c);
         }
     }
-
+    
     return tokens;
 }
 
@@ -88,7 +74,7 @@ bool is_right_associative(const std::string& op) {
 std::vector<Token> to_postfix(const std::vector<Token>& tokens) {
     std::vector<Token> output;
     std::stack<Token> stack;
-
+    
     for (const auto& token : tokens) {
         if (token.type == TokenType::Number || token.type == TokenType::Variable) {
             output.push_back(token);
@@ -122,17 +108,16 @@ std::vector<Token> to_postfix(const std::vector<Token>& tokens) {
             }
         }
     }
-
+    
     while (!stack.empty()) {
-        if (stack.top().type == TokenType::LeftParen) throw std::runtime_error("Mismatched parentheses");
+        if (stack.top().type == TokenType::LeftParen) 
+            throw std::runtime_error("Mismatched parentheses");
         output.push_back(stack.top());
         stack.pop();
     }
-
+    
     return output;
 }
-
-
 
 std::vector<std::string> split_expression(const std::string& expr) {
     std::vector<std::string> terms;
@@ -145,41 +130,79 @@ std::vector<std::string> split_expression(const std::string& expr) {
         if (c == '(') paren++;
         else if (c == ')') paren--;
         
-        // Check for +/- operators that are not inside parentheses
-        if ((c == '+' || c == '-') && paren == 0) {
-            // Skip if this is the first character or after another operator (unary operator)
-            bool is_binary_operator = (i > 0);
+        if ((c == '+' || c == '-') && paren == 0 && i > 0) {
+            char prev = expr[i-1];
+            bool is_binary = !(prev == '+' || prev == '-' || prev == '*' || 
+                              prev == '/' || prev == '^' || prev == '(' || 
+                              prev == 'e' || prev == 'E');
             
-            if (is_binary_operator) {
-                char prev = expr[i-1];
-                // Check if previous char is an operator or left parenthesis (making this a unary + or -)
-                if (prev == '+' || prev == '-' || prev == '*' || prev == '/' || prev == '^' || prev == '(' || prev == 'e' || prev == 'E') {
-                    is_binary_operator = false;  // This is likely a sign or part of scientific notation
-                }
-            }
-            
-            if (is_binary_operator) {
+            if (is_binary) {
                 if (!current.empty()) {
                     terms.push_back(current);
                     current.clear();
                 }
-                
-                // If it's a minus sign, we add it to the next term
-                if (c == '-') {
-                    current += c;
-                }
-                // We skip the + sign as it's implied between terms
+                if (c == '-') current += c;
                 continue;
             }
         }
-        
-        // Add the character to the current term
         current += c;
     }
     
-    if (!current.empty()) {
-        terms.push_back(current);
+    if (!current.empty()) terms.push_back(current);
+    return terms;
+}
+
+CompiledExpr compile_expression(const std::vector<Token>& postfix, int dims) {
+    CompiledExpr compiled;
+    compiled.expr_length = postfix.size();
+    compiled.dimensions = dims;
+    
+    for (const auto& token : postfix) {
+        compiled.types.push_back(token.type);
+        
+        if (token.type == TokenType::Number) {
+            compiled.constants.push_back(std::stof(token.value));
+            compiled.var_indices.push_back(-1);
+            compiled.op_codes.push_back(-1);
+        }
+        else if (token.type == TokenType::Variable) {
+            compiled.constants.push_back(0.0f);
+            if (token.value == "x") compiled.var_indices.push_back(0);
+            else if (token.value == "y") compiled.var_indices.push_back(1);
+            else if (token.value == "z") compiled.var_indices.push_back(2);
+            else if (token.value == "w") compiled.var_indices.push_back(3);
+            else compiled.var_indices.push_back(-1);
+            compiled.op_codes.push_back(-1);
+        }
+        else if (token.type == TokenType::Operator) {
+            compiled.constants.push_back(0.0f);
+            compiled.var_indices.push_back(-1);
+            if (token.value == "+") compiled.op_codes.push_back(0);
+            else if (token.value == "-") compiled.op_codes.push_back(1);
+            else if (token.value == "*") compiled.op_codes.push_back(2);
+            else if (token.value == "/") compiled.op_codes.push_back(3);
+            else if (token.value == "^") compiled.op_codes.push_back(4);
+            else compiled.op_codes.push_back(-1);
+        }
+        else if (token.type == TokenType::Function) {
+            compiled.constants.push_back(0.0f);
+            compiled.var_indices.push_back(-1);
+            if (token.value == "sin") compiled.op_codes.push_back(10);
+            else if (token.value == "cos") compiled.op_codes.push_back(11);
+            else if (token.value == "log") compiled.op_codes.push_back(12);
+            else if (token.value == "ln") compiled.op_codes.push_back(13);
+            else if (token.value == "exp") compiled.op_codes.push_back(14);
+            else if (token.value == "sqrt") compiled.op_codes.push_back(15);
+            else if (token.value == "tan") compiled.op_codes.push_back(16);
+            else if (token.value == "abs") compiled.op_codes.push_back(17);
+            else compiled.op_codes.push_back(-1);
+        }
+        else {
+            compiled.constants.push_back(0.0f);
+            compiled.var_indices.push_back(-1);
+            compiled.op_codes.push_back(-1);
+        }
     }
     
-    return terms;
+    return compiled;
 }
