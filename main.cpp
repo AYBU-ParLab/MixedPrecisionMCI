@@ -22,7 +22,8 @@ void analyze_accuracy_comprehensive(
     const std::vector<double>& bounds_min,
     const std::vector<double>& bounds_max,
     const std::vector<CompiledExpr>& compiled,
-    const GPUConfig& config)
+    const GPUConfig& config,
+    bool enable_fp16)
 {
     std::cout << "\n=== COMPREHENSIVE ACCURACY ANALYSIS ===\n";
     std::cout << "Testing COMPLETE expression with " << terms.size() << " terms\n\n";
@@ -52,15 +53,15 @@ void analyze_accuracy_comprehensive(
     
     // Test multiple sample counts
     std::vector<size_t> sample_counts = {1000, 10000, 100000, 1000000, 10000000};
-    
-    std::cout << std::setw(12) << "Samples" 
-              << std::setw(18) << "FP16 Rel.Error"
-              << std::setw(18) << "FP32 Rel.Error"
-              << std::setw(18) << "FP64 Rel.Error"
-              << std::setw(18) << "FP16 Value"
-              << std::setw(18) << "FP32 Value"
+
+    std::cout << std::setw(12) << "Samples";
+    if (enable_fp16) std::cout << std::setw(18) << "FP16 Rel.Error";
+    std::cout << std::setw(18) << "FP32 Rel.Error"
+              << std::setw(18) << "FP64 Rel.Error";
+    if (enable_fp16) std::cout << std::setw(18) << "FP16 Value";
+    std::cout << std::setw(18) << "FP32 Value"
               << std::setw(18) << "FP64 Value" << "\n";
-    std::cout << std::string(120, '-') << "\n";
+    std::cout << std::string(enable_fp16 ? 120 : 84, '-') << "\n";
     
     struct Result { 
         size_t samples; 
@@ -72,61 +73,73 @@ void analyze_accuracy_comprehensive(
     for (size_t n : sample_counts) {
         Result r;
         r.samples = n;
-        
-        // FP16 - sum all terms
-        auto res_fp16 = monte_carlo_integrate_nd_cuda_batch_fp16(
-            n, bounds_min, bounds_max, compiled, config);
-        r.fp16_val = 0.0;
-        for (auto v : res_fp16) r.fp16_val += v;
-        r.fp16_err = std::abs(r.fp16_val - analytical) / std::abs(analytical);
-        
+
+        // FP16 - sum all terms (if enabled)
+        if (enable_fp16) {
+            auto res_fp16 = monte_carlo_integrate_nd_cuda_batch_fp16(
+                n, bounds_min, bounds_max, compiled, config);
+            r.fp16_val = 0.0;
+            for (auto v : res_fp16) r.fp16_val += v;
+            r.fp16_err = std::abs(r.fp16_val - analytical) / std::abs(analytical);
+        } else {
+            r.fp16_val = 0.0;
+            r.fp16_err = 0.0;
+        }
+
         // FP32 - sum all terms
         auto res_fp32 = monte_carlo_integrate_nd_cuda_batch<float>(
             n, bounds_min, bounds_max, compiled, config);
         r.fp32_val = 0.0;
         for (auto v : res_fp32) r.fp32_val += v;
         r.fp32_err = std::abs(r.fp32_val - analytical) / std::abs(analytical);
-        
+
         // FP64 - sum all terms
         auto res_fp64 = monte_carlo_integrate_nd_cuda_batch<double>(
             n, bounds_min, bounds_max, compiled, config);
         r.fp64_val = 0.0;
         for (auto v : res_fp64) r.fp64_val += v;
         r.fp64_err = std::abs(r.fp64_val - analytical) / std::abs(analytical);
-        
-        std::cout << std::setw(12) << n
-                  << std::setw(18) << std::scientific << std::setprecision(4) << r.fp16_err
-                  << std::setw(18) << r.fp32_err
-                  << std::setw(18) << r.fp64_err
-                  << std::setw(18) << std::fixed << std::setprecision(8) << r.fp16_val
-                  << std::setw(18) << r.fp32_val
+
+        std::cout << std::setw(12) << n;
+        if (enable_fp16) std::cout << std::setw(18) << std::scientific << std::setprecision(4) << r.fp16_err;
+        std::cout << std::setw(18) << std::scientific << std::setprecision(4) << r.fp32_err
+                  << std::setw(18) << r.fp64_err;
+        if (enable_fp16) std::cout << std::setw(18) << std::fixed << std::setprecision(8) << r.fp16_val;
+        std::cout << std::setw(18) << std::fixed << std::setprecision(8) << r.fp32_val
                   << std::setw(18) << std::setprecision(10) << r.fp64_val << "\n";
-        
+
         results.push_back(r);
     }
     
     // Convergence analysis
     std::cout << "\n=== Error Convergence Analysis ===\n";
     std::cout << "MC error should scale as O(1/sqrt(N))\n";
-    
+
     if (results.size() >= 2) {
         double n1 = results[results.size()-2].samples;
         double n2 = results[results.size()-1].samples;
         double theoretical = std::sqrt(n2 / n1);
-        
-        double fp16_imp = results[results.size()-2].fp16_err / 
-                         std::max(1e-15, results[results.size()-1].fp16_err);
-        double fp32_imp = results[results.size()-2].fp32_err / 
-                         std::max(1e-15, results[results.size()-1].fp32_err);
-        double fp64_imp = results[results.size()-2].fp64_err / 
-                         std::max(1e-15, results[results.size()-1].fp64_err);
-        
-        std::cout << "Theoretical improvement (" << (int)n1 << " -> " << (int)n2 << "): " 
+
+        // Only calculate improvement if errors are significant (>1e-6)
+        // Otherwise the ratio is dominated by noise
+        auto calc_improvement = [](double err1, double err2) {
+            if (err2 < 1e-6 || err1 < 1e-6) return -1.0;  // Mark as N/A
+            return err1 / err2;
+        };
+
+        double fp16_imp = calc_improvement(results[results.size()-2].fp16_err,
+                                          results[results.size()-1].fp16_err);
+        double fp32_imp = calc_improvement(results[results.size()-2].fp32_err,
+                                          results[results.size()-1].fp32_err);
+        double fp64_imp = calc_improvement(results[results.size()-2].fp64_err,
+                                          results[results.size()-1].fp64_err);
+
+        std::cout << "Theoretical improvement (" << (int)n1 << " -> " << (int)n2 << "): "
                   << std::fixed << std::setprecision(2) << theoretical << "x\n";
         std::cout << "Actual improvements:\n";
-        std::cout << "  FP16: " << fp16_imp << "x\n";
-        std::cout << "  FP32: " << fp32_imp << "x\n";
-        std::cout << "  FP64: " << fp64_imp << "x\n";
+        std::cout << "  FP16: " << (fp16_imp > 0 ? std::to_string(fp16_imp).substr(0,6) : "N/A (noise dominated)") << "x\n";
+        std::cout << "  FP32: " << (fp32_imp > 0 ? std::to_string(fp32_imp).substr(0,6) : "N/A (noise dominated)") << "x\n";
+        std::cout << "  FP64: " << (fp64_imp > 0 ? std::to_string(fp64_imp).substr(0,6) : "N/A (noise dominated)") << "x\n";
     }
 }
 
@@ -176,15 +189,17 @@ static std::vector<std::string> extract_variables(const std::string &expr) {
     static const std::set<std::string> funcs = {
         "sin","cos","tan","asin","acos","atan",
         "sinh","cosh","tanh","log","log10","exp",
-        "sqrt","pow","abs","min","max"
+        "sqrt","pow","abs","min","max","ln"
     };
     std::vector<std::string> vars;
     std::set<std::string> seen;
+    // Use regex to find all identifiers in order of appearance
     std::regex re("([A-Za-z_]\\w*)");
     for (auto it = std::sregex_iterator(expr.begin(), expr.end(), re); it != std::sregex_iterator(); ++it) {
         std::string tok = (*it)[1].str();
         if (funcs.count(tok)) continue;
         if (tok == "pi" || tok == "e") continue;
+        // Add in order of first appearance (NO SORTING!)
         if (seen.insert(tok).second) vars.push_back(tok);
     }
     return vars;
@@ -276,15 +291,19 @@ int main(int argc, char** argv) {
     std::cout << "  FP64 throughput: " << (deviceProp.major >= 8 ? "1/32" : "1/64") << " of FP32\n\n";
     
     CUDA_CHECK(cudaSetDevice(0));
-    GPUConfig config = get_optimal_gpu_config();
-    
+    GPUConfig config = detect_gpu();
+
+    // Initialize FP16 constant memory
+    init_fp16_constants();
+
     // Defaults (used if not overridden via CLI)
     std::string expr = "sin(x + y + z + w)+ cos(x*y) - log(1 + z*w) * x^5 + y^4 * exp(-w) - z^2 + x^12 - w^3 + sin(z*w^2) - 4";
     size_t total_samples = 100000000; // 100M
-    double tolerance = 1e-5;
+    double tolerance = 1e-3;
     std::vector<double> bounds_min;
     std::vector<double> bounds_max;
     int explicit_dims = -1;
+    bool enable_fp16 = false;
 
     // Simple CLI parsing
     for (int i = 1; i < argc; ++i) {
@@ -307,9 +326,12 @@ int main(int argc, char** argv) {
         else if (a == "--bounds-max" && i+1 < argc) { bounds_max = parse_comma_doubles(argv[++i]); }
         else if (a == "--dims" && i+1 < argc) { explicit_dims = std::stoi(argv[++i]); }
         else if (a == "--tolerance" && i+1 < argc) { tolerance = std::stod(argv[++i]); }
+        else if (a == "--half" || a == "--fp16") { enable_fp16 = true; }
         else if (a == "--help" || a == "-h") {
-            std::cout << "Usage: ./mci_optimized --func \"FUNC\" --bounds \"min1:max1,min2:max2\" --sample N [--dims D] [--tolerance T]\n";
+            std::cout << "Usage: ./mci_optimized --func \"FUNC\" --bounds \"min1:max1,min2:max2\" --sample N [--dims D] [--tolerance T] [--half]\n";
             std::cout << "Alternate (backwards compatible): --expr, --samples, --bounds-min, --bounds-max\n";
+            std::cout << "Options:\n";
+            std::cout << "  --half, --fp16   Enable FP16 (half precision) support\n";
             return EXIT_SUCCESS;
         }
     }
@@ -331,11 +353,19 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "Using expression: " << expr << "\n";
-    std::cout << "Detected dims: " << dims << "\n";
+    std::cout << "Detected variables: ";
+    if (vars.empty()) {
+        std::cout << "(none - constant expression)";
+    } else {
+        for (size_t i = 0; i < vars.size(); ++i) {
+            std::cout << vars[i];
+            if (i < vars.size() - 1) std::cout << ", ";
+        }
+    }
+    std::cout << "\n";
+    std::cout << "Detected dimensions: " << dims << " (max 10)\n";
     std::cout << "Total samples: " << total_samples << "\n";
-    std::cout << "Error tolerance: " << tolerance << " (default)\n";
-    
-    std::cout << "Error tolerance: " << tolerance << " (default)\n";
+    std::cout << "Error tolerance: " << tolerance << "\n";
     
     // Compile expression
     auto terms = split_expression(expr);
@@ -343,7 +373,7 @@ int main(int argc, char** argv) {
     for (const auto& term : terms) {
         auto tokens = tokenize(term);
         auto postfix = to_postfix(tokens);
-        compiled_exprs.push_back(compile_expression(postfix, dims));
+        compiled_exprs.push_back(compile_expression(postfix, dims, &vars));
     }
     
     std::cout << "\n=== Expression Analysis ===\n";
@@ -354,12 +384,14 @@ int main(int argc, char** argv) {
               << std::setprecision(4) << volume << "\n";
     
     // Warmup
-    monte_carlo_integrate_nd_cuda_batch_fp16(
-        1000, bounds_min, bounds_max, compiled_exprs, config);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    if (enable_fp16) {
+        monte_carlo_integrate_nd_cuda_batch_fp16(
+            1000, bounds_min, bounds_max, compiled_exprs, config);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
     
     // FIXED: Pass all terms for accuracy analysis
-    analyze_accuracy_comprehensive(terms, bounds_min, bounds_max, compiled_exprs, config);
+    analyze_accuracy_comprehensive(terms, bounds_min, bounds_max, compiled_exprs, config, enable_fp16);
     
     // ========================================================================
     // PRECISION-SPECIFIC BENCHMARKS
@@ -370,30 +402,32 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaEventCreate(&stop));
     
     double time_fp16 = 0, time_fp32 = 0, time_fp64 = 0;
-    
+
     // FP16 Benchmark
-    std::cout << "\n=== FP16 (Half Precision) Benchmark ===\n";
-    {
-        CUDA_CHECK(cudaEventRecord(start, 0));
-        auto results = monte_carlo_integrate_nd_cuda_batch_fp16(
-            total_samples, bounds_min, bounds_max, compiled_exprs, config);
-        CUDA_CHECK(cudaEventRecord(stop, 0));
-        CUDA_CHECK(cudaDeviceSynchronize());
-        
-        float ms;
-        CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-        time_fp16 = ms / 1000.0;
-        
-        double total = 0.0;
-        for (size_t i = 0; i < results.size(); ++i) {
-            std::cout << "  Term \"" << terms[i] << "\" = " 
-                      << std::fixed << std::setprecision(8) << results[i] << "\n";
-            total += results[i];
+    if (enable_fp16) {
+        std::cout << "\n=== FP16 (Half Precision) Benchmark ===\n";
+        {
+            CUDA_CHECK(cudaEventRecord(start, 0));
+            auto results = monte_carlo_integrate_nd_cuda_batch_fp16(
+                total_samples, bounds_min, bounds_max, compiled_exprs, config);
+            CUDA_CHECK(cudaEventRecord(stop, 0));
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            float ms;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+            time_fp16 = ms / 1000.0;
+
+            double total = 0.0;
+            for (size_t i = 0; i < results.size(); ++i) {
+                std::cout << "  Term \"" << terms[i] << "\" = "
+                          << std::fixed << std::setprecision(8) << results[i] << "\n";
+                total += results[i];
+            }
+
+            std::cout << "\nTotal result: " << std::setprecision(10) << total << "\n";
+            auto metrics = calculate_metrics(ms, total_samples, 15);
+            metrics.print();
         }
-        
-        std::cout << "\nTotal result: " << std::setprecision(10) << total << "\n";
-        auto metrics = calculate_metrics(ms, total_samples, 15);
-        metrics.print();
     }
     
     // FP32 Benchmark
@@ -462,13 +496,20 @@ int main(int argc, char** argv) {
             auto tokens = tokenize(terms[i]);
             auto postfix = to_postfix(tokens);
             term_precisions[i] = select_precision_for_term(
-                postfix, bounds_min, bounds_max, tolerance, terms[i]);
+                postfix, bounds_min, bounds_max, tolerance, terms[i], &vars);
         }
-        
+
+        // If FP16 is disabled, upgrade Half precision to Float
+        if (!enable_fp16) {
+            for (auto& p : term_precisions) {
+                if (p == Precision::Half) p = Precision::Float;
+            }
+        }
+
         auto t_end = std::chrono::high_resolution_clock::now();
         double selection_time = std::chrono::duration<double>(t_end - t_start).count();
-        
-        std::cout << "Precision selection: " << std::fixed << std::setprecision(4) 
+
+        std::cout << "Precision selection: " << std::fixed << std::setprecision(4)
                   << selection_time << " s\n";
 
         size_t cnt_h = 0, cnt_f = 0, cnt_d = 0;
@@ -490,7 +531,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < terms.size(); ++i) {
             auto tokens = tokenize(terms[i]);
             auto postfix = to_postfix(tokens);
-            auto m = analyze_expression_fast(postfix, bounds_min, bounds_max, 64);
+            auto m = analyze_expression_fast(postfix, bounds_min, bounds_max, 512, &vars);
             variances[i] = std::max(0.0L, m.var);
         }
 
@@ -544,12 +585,9 @@ int main(int argc, char** argv) {
             }
         }
 
-        std::vector<std::vector<double>> bmin_per_term(terms.size(), bounds_min);
-        std::vector<std::vector<double>> bmax_per_term(terms.size(), bounds_max);
-
-        auto mixed_res = monte_carlo_integrate_nd_cuda_batch_mixed(
-            total_samples, bounds_min, bounds_max, bmin_per_term, bmax_per_term,
-            samples_per_term, compiled_exprs, term_precisions, config);
+        auto mixed_res = monte_carlo_integrate_nd_cuda_mixed(
+            bounds_min, bounds_max, compiled_exprs,
+            term_precisions, samples_per_term, config);
 
         double total_mixed = 0.0;
         for (size_t i = 0; i < mixed_res.size(); ++i) {
@@ -593,46 +631,50 @@ int main(int argc, char** argv) {
     {
         auto t_start = std::chrono::high_resolution_clock::now();
         
-        // Create adaptive regions
+        // Create adaptive regions - auto-adjust max based on dimensions
         auto postfix = to_postfix(tokenize(expr));
         Region initial(bounds_min, bounds_max);
-        auto regions = adaptive_partition_nd(postfix, initial, 1e-2, 1e2, 256);
-        
+        size_t max_regions = std::min(256UL, static_cast<size_t>(std::pow(4, dims)));  // 4^dims capped at 256
+        auto regions = adaptive_partition_nd(postfix, initial, 0.001, 1.0, max_regions, &vars);
+
         std::cout << "Created " << regions.size() << " adaptive regions\n";
-        
-        // Precision selection per region
         std::vector<Precision> region_precisions(regions.size());
         #pragma omp parallel for
         for (size_t i = 0; i < regions.size(); ++i) {
             region_precisions[i] = select_precision_for_region(
-                postfix, regions[i], tolerance, "Region " + std::to_string(i));
+                postfix, regions[i], tolerance, "Region " + std::to_string(i), &vars);
         }
-        
+
+        // If FP16 is disabled, upgrade Half precision to Float
+        if (!enable_fp16) {
+            for (auto& p : region_precisions) {
+                if (p == Precision::Half) p = Precision::Float;
+            }
+        }
+
         auto t_end = std::chrono::high_resolution_clock::now();
         double selection_time = std::chrono::duration<double>(t_end - t_start).count();
-        
-        std::cout << "Precision selection: " << std::fixed << std::setprecision(4) 
+
+        std::cout << "Precision selection: " << std::fixed << std::setprecision(4)
                   << selection_time << " s\n";
-        
+
         size_t r_h = 0, r_f = 0, r_d = 0;
-        for (auto p : region_precisions) { 
-            if (p==Precision::Half) ++r_h; 
-            else if (p==Precision::Float) ++r_f; 
-            else ++r_d; 
+        for (auto p : region_precisions) {
+            if (p==Precision::Half) ++r_h;
+            else if (p==Precision::Float) ++r_f;
+            else ++r_d;
         }
         std::cout << "Classification:\n";
         std::cout << "  Half→FP16: " << r_h << " regions\n";
         std::cout << "  Float→FP32: " << r_f << " regions\n";
         std::cout << "  Double→FP64: " << r_d << " regions\n\n";
-        
-        CompiledExpr compiled_full = compile_expression(postfix, dims);
 
-        // Variance-based sample allocation for regions
+        CompiledExpr compiled_full = compile_expression(postfix, dims, &vars);
         std::vector<long double> region_vars(regions.size(), 0.0L);
         #pragma omp parallel for
         for (size_t i = 0; i < regions.size(); ++i) {
-            auto m = analyze_expression_fast(postfix, regions[i].bounds_min, 
-                                            regions[i].bounds_max, 64);
+            auto m = analyze_expression_fast(postfix, regions[i].bounds_min,
+                                            regions[i].bounds_max, 32, &vars);  // Reduced for speed
             region_vars[i] = std::max(0.0L, m.var);
         }
 
@@ -662,7 +704,6 @@ int main(int argc, char** argv) {
                 assigned += n;
             }
             
-            // Adjust to match total_samples exactly
             if (assigned != total_samples) {
                 long diff = (long)total_samples - (long)assigned;
                 std::vector<size_t> idx(regions.size()); 
@@ -684,70 +725,58 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // Create vector with same expression for all regions
+        std::vector<CompiledExpr> region_exprs_vec(regions.size(), compiled_full);
 
-        // Prepare region data
-        std::vector<CompiledExpr> compiled_regions(regions.size(), compiled_full);
-        std::vector<std::vector<double>> bmin_regions(regions.size()), 
-                                         bmax_regions(regions.size());
-        for (size_t i = 0; i < regions.size(); ++i) { 
-            bmin_regions[i] = regions[i].bounds_min; 
-            bmax_regions[i] = regions[i].bounds_max; 
+        // Flatten all region bounds into vectors for batch processing
+        std::vector<double> all_bounds_min, all_bounds_max;
+        for (const auto& region : regions) {
+            all_bounds_min.insert(all_bounds_min.end(), region.bounds_min.begin(), region.bounds_min.end());
+            all_bounds_max.insert(all_bounds_max.end(), region.bounds_max.begin(), region.bounds_max.end());
         }
 
-        // Execute region-wise integration
         CUDA_CHECK(cudaEventRecord(start, 0));
-        
-        auto region_res = monte_carlo_integrate_nd_cuda_batch_mixed(
-            total_samples, bounds_min, bounds_max, bmin_regions, bmax_regions,
-            samples_per_region_vec, compiled_regions, region_precisions, config);
+
+        // Process all regions in ONE batch call using the mixed precision kernel
+        // Build per-region bounds vectors
+        std::vector<std::vector<double>> bounds_min_per_region, bounds_max_per_region;
+        for (const auto& r : regions) {
+            bounds_min_per_region.push_back(r.bounds_min);
+            bounds_max_per_region.push_back(r.bounds_max);
+        }
+
+        // Call the batch mixed function once for all regions
+        auto region_results = monte_carlo_integrate_nd_cuda_batch_mixed(
+            0,  // unused when samples_per_region_vec is provided
+            bounds_min,  // global bounds (not used)
+            bounds_max,
+            bounds_min_per_region,
+            bounds_max_per_region,
+            samples_per_region_vec,
+            region_exprs_vec,
+            region_precisions,
+            config
+        );
+
+        // Sum all region results
+        double total_region = 0.0;
+        for (double r : region_results) {
+            total_region += r;
+        }
 
         CUDA_CHECK(cudaEventRecord(stop, 0));
         CUDA_CHECK(cudaDeviceSynchronize());
-        
-        // Print results
-        for (size_t i = 0; i < region_res.size(); ++i) {
-            auto p = region_precisions[i];
-            if (p == Precision::Half) {
-                std::cout << "[FP16] Region " << i << " = " << std::fixed 
-                          << std::setprecision(8) << region_res[i] << "\n";
-            } else if (p == Precision::Float) {
-                std::cout << "[FP32] Region " << i << " = " << std::fixed 
-                          << std::setprecision(10) << region_res[i] << "\n";
-            } else {
-                std::cout << "[FP64] Region " << i << " = " << std::fixed 
-                          << std::setprecision(14) << region_res[i] << "\n";
-            }
-        }
-        
         float ms_kernel;
         CUDA_CHECK(cudaEventElapsedTime(&ms_kernel, start, stop));
         double total_time = selection_time + (ms_kernel / 1000.0);
-        
-        // Sum all region results
-        double total_region = 0.0;
-        for (double r : region_res) total_region += r;
         
         std::cout << "\nRegion-wise result: " << std::setprecision(10) << total_region << "\n";
         std::cout << "Total time: " << std::setprecision(4) << total_time << " s\n";
         std::cout << "Selection overhead: " << std::setprecision(2) 
                   << (selection_time/total_time*100) << "%\n";
-        
-        double avg_cost = (r_h * 0.5 + r_f * 1.0 + r_d * 8.0) / regions.size();
-        std::cout << "Savings vs pure FP64: " << std::setprecision(1) 
-                  << ((8.0-avg_cost)/8.0*100) << "%\n";
     }
-    
-    // ========================================================================
-    // CLEANUP AND EXIT
-    // ========================================================================
-    
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
     CUDA_CHECK(cudaDeviceReset());
-    
-    std::cout << "\n================================================================\n";
-    std::cout << "  Analysis complete!\n";
-    std::cout << "================================================================\n";
-    
     return EXIT_SUCCESS;
 }

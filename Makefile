@@ -5,9 +5,9 @@ CXX = g++
 # CUDA architecture - adjust for your GPU
 # Common options:
 #   sm_86: RTX 3070/3080/3090, A6000
-#   sm_89: RTX 4070/4080/4090, L40
+#   sm_89: RTX 4050/4060/4070/4080/4090, L40
 #   sm_90: H100
-CUDA_ARCH = sm_86
+CUDA_ARCH = sm_89
 
 # Compiler flags - OPTIMIZED
 NVCC_FLAGS = -arch=$(CUDA_ARCH) -O3 --use_fast_math \

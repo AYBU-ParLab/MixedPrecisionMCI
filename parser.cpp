@@ -1,6 +1,9 @@
 #include "parser.h"
 #include <cctype>
 #include <algorithm>
+#include <stack>
+#include <stdexcept>
+#include <map>
 
 std::vector<Token> tokenize(const std::string& expr) {
     std::vector<Token> tokens;
@@ -152,14 +155,23 @@ std::vector<std::string> split_expression(const std::string& expr) {
     return terms;
 }
 
-CompiledExpr compile_expression(const std::vector<Token>& postfix, int dims) {
+CompiledExpr compile_expression(const std::vector<Token>& postfix, int dims,
+                                const std::vector<std::string>* var_names) {
     CompiledExpr compiled;
     compiled.expr_length = postfix.size();
     compiled.dimensions = dims;
-    
+
+    // Build variable name to index mapping
+    std::map<std::string, int> var_map;
+    if (var_names != nullptr) {
+        for (size_t i = 0; i < var_names->size() && i < (size_t)dims; ++i) {
+            var_map[(*var_names)[i]] = static_cast<int>(i);
+        }
+    }
+
     for (const auto& token : postfix) {
         compiled.types.push_back(token.type);
-        
+
         if (token.type == TokenType::Number) {
             compiled.constants.push_back(std::stof(token.value));
             compiled.var_indices.push_back(-1);
@@ -167,11 +179,19 @@ CompiledExpr compile_expression(const std::vector<Token>& postfix, int dims) {
         }
         else if (token.type == TokenType::Variable) {
             compiled.constants.push_back(0.0f);
-            if (token.value == "x") compiled.var_indices.push_back(0);
-            else if (token.value == "y") compiled.var_indices.push_back(1);
-            else if (token.value == "z") compiled.var_indices.push_back(2);
-            else if (token.value == "w") compiled.var_indices.push_back(3);
-            else compiled.var_indices.push_back(-1);
+            int idx = -1;
+
+            // First try using the variable map
+            if (var_map.count(token.value)) {
+                idx = var_map[token.value];
+            }
+            // Fallback to old single-character mapping
+            else if (token.value.length() == 1) {
+                char c = token.value[0];
+                if (c >= 'a' && c <= 'z') idx = c - 'a';
+                else if (c >= 'A' && c <= 'Z') idx = c - 'A';
+            }
+            compiled.var_indices.push_back(idx);
             compiled.op_codes.push_back(-1);
         }
         else if (token.type == TokenType::Operator) {

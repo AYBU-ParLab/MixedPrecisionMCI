@@ -3,581 +3,338 @@
 
 #include <vector>
 #include <string>
-#include <stack>
 #include <cmath>
 #include <random>
 #include <limits>
-#include <iostream>
-#include <omp.h>
 #include <queue>
+#include <iostream>
+#include <map>
+#include <omp.h>
 #include "parser.h"
 
 const int FIXED_SEED = 42;
 
-enum class Precision {
-    Half,           // FP16 - 16-bit
-    Float,          // FP32
-    Double,         // FP64
-    LongDouble      // FP80/128
-};
+enum class Precision { Half, Float, Double, LongDouble };
 
-// Multi-dimensional region structure with adaptive partitioning support
 struct Region {
     std::vector<double> bounds_min;
     std::vector<double> bounds_max;
     double error_estimate;
     int refinement_level;
-    
-    Region() : error_estimate(0.0), refinement_level(0) {}
-    
-    Region(const std::vector<double>& min_b, const std::vector<double>& max_b) 
-        : bounds_min(min_b), bounds_max(max_b), error_estimate(0.0), refinement_level(0) {}
-    
-    Region(double x1, double x2, double y1, double y2) 
-        : error_estimate(0.0), refinement_level(0) {
-        bounds_min = {x1, y1};
-        bounds_max = {x2, y2};
-    }
-    
+
+    Region() : error_estimate(0), refinement_level(0) {}
+    Region(const std::vector<double>& a, const std::vector<double>& b)
+        : bounds_min(a), bounds_max(b), error_estimate(0), refinement_level(0) {}
+    Region(double x1, double x2, double y1, double y2)
+        : bounds_min{x1,y1}, bounds_max{x2,y2}, error_estimate(0), refinement_level(0) {}
+
     double volume() const {
-        double vol = 1.0;
-        for (size_t i = 0; i < bounds_min.size(); ++i) {
-            vol *= (bounds_max[i] - bounds_min[i]);
-        }
-        return vol;
-    }
-    
-    std::vector<Region> subdivide() const {
-        std::vector<Region> children;
-        int dims = bounds_min.size();
-        
-        int split_dim = 0;
-        double max_span = bounds_max[0] - bounds_min[0];
-        for (int i = 1; i < dims; ++i) {
-            double span = bounds_max[i] - bounds_min[i];
-            if (span > max_span) {
-                max_span = span;
-                split_dim = i;
-            }
-        }
-        
-        double mid = 0.5 * (bounds_min[split_dim] + bounds_max[split_dim]);
-        
-        for (int i = 0; i < 2; ++i) {
-            Region child;
-            child.bounds_min = bounds_min;
-            child.bounds_max = bounds_max;
-            child.refinement_level = refinement_level + 1;
-            
-            if (i == 0) {
-                child.bounds_max[split_dim] = mid;
-            } else {
-                child.bounds_min[split_dim] = mid;
-            }
-            
-            children.push_back(child);
-        }
-        
-        return children;
+        double v = 1.0;
+        for (size_t i = 0; i < bounds_min.size(); ++i)
+            v *= (bounds_max[i] - bounds_min[i]);
+        return v;
     }
 };
 
-// ======================
-// FAST Expression Evaluation
-// ======================
+
 template<typename T>
-inline T evaluate_postfix_fast(const std::vector<Token>& postfix, const T* vars, int dims) {
-    T stack[64];
+inline T evaluate_postfix_fast(const std::vector<Token>& postfix, const T* vars, int dims,
+                               const std::vector<std::string>* var_names = nullptr) {
+    T stack[128];
     int sp = 0;
-    
-    for (const auto& token : postfix) {
-        if (token.type == TokenType::Number) {
-            stack[sp++] = static_cast<T>(std::stold(token.value));
-        } else if (token.type == TokenType::Variable) {
-            int idx = -1;
-            if (token.value == "x") idx = 0;
-            else if (token.value == "y") idx = 1;
-            else if (token.value == "z") idx = 2;
-            else if (token.value == "w") idx = 3;
-            
-            if (idx >= 0 && idx < dims) {
-                stack[sp++] = vars[idx];
-            } else {
-                stack[sp++] = 0;
-            }
-        } else if (token.type == TokenType::Operator) {
-            T b = stack[--sp];
-            T a = stack[--sp];
-            if (token.value == "+") stack[sp++] = a + b;
-            else if (token.value == "-") stack[sp++] = a - b;
-            else if (token.value == "*") stack[sp++] = a * b;
-            else if (token.value == "/") stack[sp++] = (b != 0) ? (a / b) : 0;
-            else if (token.value == "^") stack[sp++] = std::pow(a, b);
-        } else if (token.type == TokenType::Function) {
-            T a = stack[--sp];
-            if (token.value == "sin") stack[sp++] = std::sin(a);
-            else if (token.value == "cos") stack[sp++] = std::cos(a);
-            else if (token.value == "log") stack[sp++] = (a > 0) ? std::log10(a) : 0;
-            else if (token.value == "ln") stack[sp++] = (a > 0) ? std::log(a) : 0;
-            else if (token.value == "exp") stack[sp++] = std::exp(a);
-            else if (token.value == "sqrt") stack[sp++] = (a >= 0) ? std::sqrt(a) : 0;
-            else if (token.value == "tan") stack[sp++] = std::tan(a);
-            else if (token.value == "abs") stack[sp++] = std::abs(a);
+
+    // Build variable mapping if provided
+    std::map<std::string, int> var_map;
+    if (var_names != nullptr) {
+        for (size_t i = 0; i < var_names->size() && i < (size_t)dims; ++i) {
+            var_map[(*var_names)[i]] = static_cast<int>(i);
         }
     }
-    return (sp > 0) ? stack[0] : 0;
+
+    for (const auto& t : postfix) {
+        if (t.type == TokenType::Number) {
+            stack[sp++] = static_cast<T>(std::stold(t.value));
+        } else if (t.type == TokenType::Variable) {
+            int i = -1;
+            // First try variable map
+            if (var_map.count(t.value)) {
+                i = var_map[t.value];
+            }
+            // Fallback to alphabetic mapping
+            else if (t.value.length() == 1) {
+                char c = t.value[0];
+                if (c >= 'a' && c <= 'z') i = c - 'a';
+                else if (c >= 'A' && c <= 'Z') i = c - 'A';
+            }
+            stack[sp++] = (i>=0 && i<dims) ? vars[i] : T(0);
+        } else if (t.type == TokenType::Operator) {
+            T b = stack[--sp], a = stack[--sp];
+            if (t.value=="+") stack[sp++] = a+b;
+            else if (t.value=="-") stack[sp++] = a-b;
+            else if (t.value=="*") stack[sp++] = a*b;
+            else if (t.value=="/") stack[sp++] = b!=0?a/b:0;
+            else if (t.value=="^") {
+                if (std::floor(b)==b && std::abs(b)<=10) {
+                    T r=1;
+                    for(int i=0;i<(int)std::abs(b);++i) r*=a;
+                    stack[sp++] = b>=0?r:T(1)/r;
+                } else stack[sp++] = std::pow(a,b);
+            }
+        } else {
+            T a = stack[--sp];
+            if (t.value=="sin") stack[sp++] = std::sin(a);
+            else if (t.value=="cos") stack[sp++] = std::cos(a);
+            else if (t.value=="tan") stack[sp++] = std::tan(a);
+            else if (t.value=="exp") stack[sp++] = std::exp(a);
+            else if (t.value=="sqrt") stack[sp++] = a>=0?std::sqrt(a):0;
+            else if (t.value=="ln") stack[sp++] = a>0?std::log(a):0;
+            else if (t.value=="log") stack[sp++] = a>0?std::log10(a):0;
+            else if (t.value=="abs") stack[sp++] = std::abs(a);
+        }
+    }
+    return sp?stack[0]:T(0);
 }
 
-// ======================
-// Statistical Metrics - ENHANCED FOR REGIONS
-// ======================
 struct StatisticalMetrics {
-    long double avg;
-    long double var;
-    long double grad;
-    long double max_val;
-    long double min_val;
-    long double range;
-    long double coefficient_of_variation;
+    long double avg,var,grad,max_val,min_val,range,coefficient_of_variation;
     int samples_used;
 };
 
 inline StatisticalMetrics analyze_expression_fast(
     const std::vector<Token>& postfix,
-    const std::vector<double>& bounds_min,
-    const std::vector<double>& bounds_max,
-    int target_samples = 64)  // Increased for better region analysis
+    const std::vector<double>& minb,
+    const std::vector<double>& maxb,
+    int samples,
+    const std::vector<std::string>* var_names = nullptr)
 {
-    StatisticalMetrics metrics = {0, 0, 0, -1e100L, 1e100L, 0, 0, 0};
-    int dims = bounds_min.size();
-    
-    long double sum = 0, sum_sq = 0;
-    long double max_grad = 0;
-    long double max_val = -1e100L, min_val = 1e100L;
-    int valid = 0;
-    
-    #pragma omp parallel default(none) \
-        shared(postfix, bounds_min, bounds_max, dims, target_samples) \
-        reduction(+:sum, sum_sq, valid) reduction(max:max_grad, max_val) reduction(min:min_val)
+    StatisticalMetrics m{0,0,0,-1e300L,1e300L,0,0,0};
+    int d = minb.size();
+
+    long double sum=0,sumsq=0,maxg=0;
+    int n=0;
+
+#pragma omp parallel
     {
-        std::mt19937 gen(FIXED_SEED + omp_get_thread_num());
-        std::vector<std::uniform_real_distribution<long double>> dists;
-        for (int d = 0; d < dims; ++d) {
-            dists.emplace_back(bounds_min[d], bounds_max[d]);
-        }
-        
-        #pragma omp for
-        for (int i = 0; i < target_samples; ++i) {
-            long double vars[4] = {0, 0, 0, 0};
-            for (int d = 0; d < dims; ++d) {
-                vars[d] = dists[d](gen);
-                if (vars[d] <= 1e-12L) vars[d] = 1e-12L;
+        std::mt19937 gen(FIXED_SEED + omp_get_thread_num()*1315423911);
+        long double lsum=0,lsumsq=0,lmaxg=0,lmax=-1e300L,lmin=1e300L;
+        int ln=0;
+
+#pragma omp for
+        for(int i=0;i<samples;i++){
+            long double vars[32]={0};
+            for(int k=0;k<d;k++){
+                std::uniform_real_distribution<long double> dist(minb[k],maxb[k]);
+                vars[k]=dist(gen);
             }
-            
-            try {
-                long double val = evaluate_postfix_fast<long double>(postfix, vars, dims);
-                sum += val;  // Use signed value for avg
-                sum_sq += val * val;
-                max_val = std::max(max_val, val);
-                min_val = std::min(min_val, val);
-                valid++;
-                
-                // Gradient estimation - all dimensions
-                for (int d = 0; d < std::min(dims, 2); ++d) {  // First 2 dims for speed
-                    long double h = (bounds_max[d] - bounds_min[d]) * 0.01;
-                    long double vars_h[4];
-                    for (int k = 0; k < dims; ++k) vars_h[k] = vars[k];
-                    vars_h[d] += h;
-                    if (vars_h[d] <= bounds_max[d]) {
-                        long double val_h = evaluate_postfix_fast<long double>(postfix, vars_h, dims);
-                        long double grad_est = std::abs((val_h - val) / h);
-                        max_grad = std::max(max_grad, grad_est);
-                    }
+
+            long double v=evaluate_postfix_fast<long double>(postfix,vars,d,var_names);
+            lsum+=v;
+            lsumsq+=v*v;
+            lmax=std::max(lmax,v);
+            lmin=std::min(lmin,v);
+            ln++;
+
+            // Compute gradient for ALL dimensions (not just first 2)
+            for(int k=0;k<d;k++){
+                long double h=(maxb[k]-minb[k])*1e-2;
+                vars[k]+=h;
+                if(vars[k]<=maxb[k]){
+                    long double vh=evaluate_postfix_fast<long double>(postfix,vars,d,var_names);
+                    lmaxg=std::max(lmaxg,std::abs((vh-v)/h));
                 }
-            } catch (...) {}
+                vars[k]-=h;
+            }
+        }
+
+#pragma omp critical
+        {
+            sum+=lsum;
+            sumsq+=lsumsq;
+            maxg=std::max(maxg,lmaxg);
+            m.max_val=std::max(m.max_val,lmax);
+            m.min_val=std::min(m.min_val,lmin);
+            n+=ln;
         }
     }
-    
-    if (valid < 2) return metrics;
-    
-    metrics.avg = sum / valid;
-    metrics.var = (sum_sq / valid) - (metrics.avg * metrics.avg);
-    metrics.grad = max_grad;
-    metrics.max_val = max_val;
-    metrics.min_val = min_val;
-    metrics.range = max_val - min_val;
-    metrics.coefficient_of_variation = std::sqrt(std::abs(metrics.var)) / (std::abs(metrics.avg) + 1e-10L);
-    metrics.samples_used = valid;
-    
-    return metrics;
+
+    if(n<2) return m;
+
+    m.avg=sum/n;
+    m.var=sumsq/n-m.avg*m.avg;
+    m.grad=maxg;
+    m.range=m.max_val-m.min_val;
+    m.coefficient_of_variation=std::sqrt(std::abs(m.var))/(std::abs(m.avg)+1e-12L);
+    m.samples_used=n;
+    return m;
 }
 
-// Single-threaded, lightweight variant for use inside parallel regions
-inline StatisticalMetrics analyze_expression_fast_serial(
-    const std::vector<Token>& postfix,
-    const std::vector<double>& bounds_min,
-    const std::vector<double>& bounds_max,
-    int target_samples = 16)
-{
-    StatisticalMetrics metrics = {0, 0, 0, -1e100L, 1e100L, 0, 0, 0};
-    int dims = bounds_min.size();
-
-    long double sum = 0, sum_sq = 0;
-    long double max_grad = 0;
-    long double max_val = -1e100L, min_val = 1e100L;
-    int valid = 0;
-
-    std::mt19937 gen(FIXED_SEED);
-    std::vector<std::uniform_real_distribution<long double>> dists;
-    for (int d = 0; d < dims; ++d) {
-        dists.emplace_back(bounds_min[d], bounds_max[d]);
-    }
-
-    for (int i = 0; i < target_samples; ++i) {
-        std::vector<long double> vars(dims);
-        for (int d = 0; d < dims; ++d) {
-            vars[d] = dists[d](gen);
-            if (vars[d] <= 1e-12L) vars[d] = 1e-12L;
-        }
-
-        try {
-            long double val = evaluate_postfix_fast<long double>(postfix, vars.data(), dims);
-            sum += val;
-            sum_sq += val * val;
-            max_val = std::max(max_val, val);
-            min_val = std::min(min_val, val);
-            valid++;
-
-            // Simple gradient estimate (first two dims)
-            for (int d = 0; d < std::min(dims, 2); ++d) {
-                long double h = (bounds_max[d] - bounds_min[d]) * 0.01L;
-                std::vector<long double> vars_h(vars.begin(), vars.end());
-                vars_h[d] += h;
-                if (vars_h[d] <= bounds_max[d]) {
-                    long double val_h = evaluate_postfix_fast<long double>(postfix, vars_h.data(), dims);
-                    long double grad_est = std::abs((val_h - val) / h);
-                    if (grad_est > max_grad) max_grad = grad_est;
-                }
-            }
-        } catch (...) {}
-    }
-
-    if (valid < 2) return metrics;
-
-    metrics.avg = sum / valid;
-    metrics.var = (sum_sq / valid) - (metrics.avg * metrics.avg);
-    metrics.grad = max_grad;
-    metrics.max_val = max_val;
-    metrics.min_val = min_val;
-    metrics.range = max_val - min_val;
-    metrics.coefficient_of_variation = std::sqrt(std::abs(metrics.var)) / (std::abs(metrics.avg) + 1e-10L);
-    metrics.samples_used = valid;
-
-    return metrics;
-}
-
-// ======================
-// GELIŞTIRILMIŞ PRECISION SELECTION - TERIM ÖZELLİKLERİNE GÖRE
-// ======================
 inline Precision select_precision_fast(
-    const StatisticalMetrics& metrics,
+    const StatisticalMetrics& m,
     double tol,
-    const std::string& name,
-    bool termwise = false)
+    const std::string&,
+    bool)
 {
-    // 1. CONSTANT CHECK - Sabit terimler -> FP16
-    if (metrics.var == 0 && metrics.grad == 0) {
-        std::cout << "  [" << name << "] Constant detected -> FP16\n";
-        return Precision::Half;
-    }
-    
-    // 2. BOUNDED SMOOTH FUNCTIONS - sin, cos gibi sınırlı fonksiyonlar
-    // Avg ve max_val küçükse (< 2.0) ve varyans düşükse -> FP16
-    if (termwise && metrics.max_val < 2.5L && metrics.avg < 2.0L) {
-        long double normalized_var = metrics.var / (metrics.avg * metrics.avg + 1e-10L);
-        if (normalized_var < 0.3L) {
-            std::cout << "  [" << name << "] Bounded smooth function (max=" 
-                      << metrics.max_val << ", var=" << normalized_var << ") -> FP16\n";
-            return Precision::Half;
-        }
-    }
-    
-    // 3. SMALL MAGNITUDE - Küçük değerli terimler (|avg| < 1.0)
-    if (termwise && std::abs(metrics.avg) < 1.0L && metrics.max_val < 1.5L) {
-        long double grad_ratio = metrics.grad / (std::abs(metrics.avg) + 1e-10L);
-        if (grad_ratio < 5.0L) {
-            std::cout << "  [" << name << "] Small magnitude (avg=" 
-                      << metrics.avg << ", max=" << metrics.max_val << ") -> FP16\n";
-            return Precision::Half;
-        }
-    }
-    
-    // 4. POLYNOMIAL GROWTH CHECK - x^7, x^12 gibi büyük üslü terimler
-    // Max değer çok büyükse (>100) veya gradient çok büyükse -> FP64
-    if (termwise && (metrics.max_val > 100.0L || metrics.grad > 50.0L)) {
-        std::cout << "  [" << name << "] Large growth detected (max=" 
-                  << metrics.max_val << ", grad=" << metrics.grad << ") -> FP64\n";
-        return Precision::Double;
-    }
-    
-    // 5. LOGARITHMIC/PRECISION-SENSITIVE - log, hassas işlemler
-    // Varyans/ortalama oranı yüksekse -> FP64
-    if (termwise && metrics.var > 0) {
-        long double cv = std::sqrt(std::abs(metrics.var)) / (std::abs(metrics.avg) + 1e-10L);
-        if (cv > 1.5L && metrics.max_val > 5.0L) {
-            std::cout << "  [" << name << "] High variance ratio (CV=" 
-                      << cv << ") -> FP64\n";
-            return Precision::Double;
-        }
-    }
-    
-    // 6. MEDIUM COMPLEXITY - Orta ölçekli terimler -> FP32
-    if (termwise) {
-        long double normalized_var = metrics.var / (metrics.avg * metrics.avg + 1e-10L);
-        long double grad_ratio = metrics.grad / (std::abs(metrics.avg) + 1e-10L);
-        
-        // Orta düzeyde smooth ve orta büyüklük
-        if (normalized_var < 0.5L && grad_ratio < 10.0L && metrics.max_val < 50.0L) {
-            std::cout << "  [" << name << "] Medium complexity (var=" 
-                      << normalized_var << ", grad_ratio=" << grad_ratio << ") -> FP32\n";
-            return Precision::Float;
-        }
-    }
-    
-    const long double eps_h = 4.88e-4L;  // FP16: 2^-11
-    const long double eps_f = std::numeric_limits<float>::epsilon();
-    const long double eps_d = std::numeric_limits<double>::epsilon();
-    
-    long double max_val = std::max(std::abs(metrics.avg), std::sqrt(std::abs(metrics.var)));
-    max_val = std::max(max_val, 1e-10L);
-    
-    long double norm_grad = std::max(metrics.grad, 1.0L);
-    long double cond = norm_grad * max_val / std::max(std::abs(metrics.avg), static_cast<long double>(tol));
-    cond = std::max(cond, 1.0L);
-    cond = std::min(cond, 1000.0L);
-    
-    long double operation_count = termwise ? 5.0L : 8.0L;
-    
-    long double err_h = eps_h * max_val * cond * std::sqrt(operation_count);
-    long double err_f = eps_f * max_val * cond * std::sqrt(operation_count);
-    long double err_d = eps_d * max_val * cond * std::sqrt(operation_count);
-    
-    double safety_factor = termwise ? 5.0 : 1.0;  // Balanced safety
+    // Constants are always Half precision
+    if (m.var==0 && m.grad==0) return Precision::Half;
 
-    if (err_h <= tol / safety_factor) {
+    long double eps16=4.88e-4L;
+    long double eps32=1.19e-7L;  // float epsilon
+    long double eps64=2.22e-16L; // double epsilon
+
+    // Estimate typical function value magnitude
+    long double scale = std::max(std::abs(m.avg), std::sqrt(std::abs(m.var)));
+    scale = std::max(scale, m.range * 0.5L);
+    scale = std::max(scale, 1e-12L);
+
+    // Proper condition number based on gradient (sensitivity to input perturbations)
+    // For integration: relative gradient scaled by typical domain size
+    long double typical_input_scale = 1.0L; // Assuming normalized domain ~O(1)
+    long double relative_gradient = (m.grad * typical_input_scale) / (scale + 1e-12L);
+    long double cond = std::max(1.0L, relative_gradient);
+
+    // Monte Carlo error per sample: ~sqrt(variance)
+    long double mc_error_per_sample = std::sqrt(std::abs(m.var));
+
+    // Rounding error estimates
+    long double rounding_err16 = eps16 * scale * cond;
+    long double rounding_err32 = eps32 * scale * cond;
+    long double rounding_err64 = eps64 * scale * cond;
+
+    // For Monte Carlo integration, we want rounding error << MC statistical error
+    // Use 1% threshold: if rounding error < 0.01 * MC_error, precision is sufficient
+    long double mc_threshold = mc_error_per_sample * 0.01L;
+
+    // Compare rounding errors to both MC error and user tolerance
+    if(rounding_err16 < mc_threshold && rounding_err16 < tol * 0.01L) {
         return Precision::Half;
     }
-    if (err_f <= tol / safety_factor) {
+    if(rounding_err32 < mc_threshold && rounding_err32 < tol * 0.1L) {
         return Precision::Float;
     }
-    if (err_d <= tol / safety_factor) {
+    if(rounding_err64 < tol * 0.5L) {
         return Precision::Double;
     }
-    
-    std::cout << "  [" << name << "] High precision required -> FP64\n";
-    return Precision::Double;
+    return Precision::LongDouble;
 }
 
-// ======================
-// ADAPTIVE REGION PARTITIONING (priority-driven, bounded by max_regions)
-// ======================
-inline std::vector<Region> adaptive_partition_nd(
-    const std::vector<Token>& postfix,
-    const Region& initial_region,
-    double variance_threshold = 1e-2,
-    double gradient_threshold = 1e2,
-    size_t max_regions = 256)
-{
-    struct PQItem { Region region; long double score; int depth; };
-    auto cmp = [](const PQItem& a, const PQItem& b) { return a.score < b.score; };
-    std::priority_queue<PQItem, std::vector<PQItem>, decltype(cmp)> pq(cmp);
-
-    int dims = static_cast<int>(initial_region.bounds_min.size());
-
-    std::cout << "\nAdaptive Partitioning (" << dims << "D)...\n";
-    std::cout << "  Variance threshold: " << variance_threshold << "\n";
-    std::cout << "  Gradient threshold: " << gradient_threshold << "\n";
-
-    // Compute metric for initial region
-    auto m0 = analyze_expression_fast(postfix, initial_region.bounds_min, initial_region.bounds_max, 50);
-    long double score0 = std::max(m0.var / variance_threshold, m0.grad / gradient_threshold);
-    pq.push(PQItem{initial_region, score0, 0});
-
-    std::vector<Region> final_regions;
-
-    // Continue splitting the most 'complex' region while we have budget and useful splits
-    while (!pq.empty() && (final_regions.size() + pq.size()) < max_regions) {
-        auto top = pq.top();
-        if (top.score <= 1.0L) break; // no region exceeds thresholds
-        pq.pop();
-
-        Region current = top.region;
-
-        // Don't split if too small
-        double min_size = 1e-9; // tighter min size to avoid unnecessary early stopping
-        bool too_small = false;
-        for (int d = 0; d < dims; ++d) {
-            if (current.bounds_max[d] - current.bounds_min[d] < min_size) { too_small = true; break; }
-        }
-        if (too_small) { final_regions.push_back(current); continue; }
-
-        // Split by largest extent
-        int split_dim = 0;
-        double max_extent = current.bounds_max[0] - current.bounds_min[0];
-        for (int d = 1; d < dims; ++d) {
-            double extent = current.bounds_max[d] - current.bounds_min[d];
-            if (extent > max_extent) { max_extent = extent; split_dim = d; }
-        }
-
-        double mid = 0.5 * (current.bounds_min[split_dim] + current.bounds_max[split_dim]);
-        Region r1 = current; r1.bounds_max[split_dim] = mid;
-        Region r2 = current; r2.bounds_min[split_dim] = mid;
-
-        // Analyze children
-        auto m1 = analyze_expression_fast(postfix, r1.bounds_min, r1.bounds_max, 40);
-        auto m2 = analyze_expression_fast(postfix, r2.bounds_min, r2.bounds_max, 40);
-        long double s1 = std::max(m1.var / variance_threshold, m1.grad / gradient_threshold);
-        long double s2 = std::max(m2.var / variance_threshold, m2.grad / gradient_threshold);
-
-        pq.push(PQItem{r1, s1, top.depth + 1});
-        pq.push(PQItem{r2, s2, top.depth + 1});
-    }
-
-    // Flush remaining priority queue into final regions until max_regions
-    while (!pq.empty() && final_regions.size() < max_regions) {
-        final_regions.push_back(pq.top().region);
-        pq.pop();
-    }
-
-    std::cout << "  Created " << final_regions.size() << " adaptive regions\n";
-    return final_regions;
-}
-
-// ======================
-// CONVENIENCE WRAPPERS
-// ======================
 inline Precision select_precision_for_term(
     const std::vector<Token>& postfix,
-    const std::vector<double>& bounds_min,
-    const std::vector<double>& bounds_max,
+    const std::vector<double>& minb,
+    const std::vector<double>& maxb,
     double tol,
-    const std::string& name)
+    const std::string& name,
+    const std::vector<std::string>* var_names = nullptr)
 {
-    auto metrics = analyze_expression_fast(postfix, bounds_min, bounds_max, 64);
-    return select_precision_fast(metrics, tol, name, true);
+    auto m=analyze_expression_fast(postfix,minb,maxb,256,var_names);  // Increased for better stats
+    return select_precision_fast(m,tol,name,true);
 }
 
 inline Precision select_precision_for_region(
     const std::vector<Token>& postfix,
-    const Region& region,
-    double tol,
-    const std::string& name)
-{
-    // Two-stage cheap->heavy serial analysis to minimize selection overhead
-    auto quick = analyze_expression_fast_serial(postfix, region.bounds_min, region.bounds_max, 6);
-
-    // Fast rules based on cheap estimates
-    if (std::abs(quick.avg) < 0.5 && quick.range < 0.5 && std::abs(quick.max_val) < 1.0 && quick.grad < 2.0) {
-        return Precision::Half;
-    }
-
-    if (quick.max_val > 50.0 || quick.grad > 80.0) {
-        return Precision::Double;
-    }
-
-    if (quick.coefficient_of_variation < 0.5 && quick.grad < 10.0 && std::abs(quick.avg) < 5.0) {
-        return Precision::Float;
-    }
-
-    // Uncertain cases: run a slightly heavier serial analysis and use the enhanced selector
-    auto metrics = analyze_expression_fast_serial(postfix, region.bounds_min, region.bounds_max, 32);
-    return select_precision_fast(metrics, tol, name, false);
-}
-
-// ======================
-// ENHANCED REGION-WISE PRECISION SELECTION (ported from newMixed_v2)
-// ======================
-inline Precision select_precision_enhanced(
-    const StatisticalMetrics& metrics,
+    const Region& r,
     double tol,
     const std::string& name,
-    bool verbose = true)
+    const std::vector<std::string>* var_names = nullptr)
 {
-    // Handle degenerate cases
-    if (metrics.var == 0 && metrics.grad == 0) {
-        if (verbose) {
-            std::cout << "\n[" << name << "] Constant region detected -> FP16\n";
-        }
-        return Precision::Half;
-    }
+    // Use MORE samples for regions (512 vs 256 for terms) to get accurate variance/gradient estimates
+    // Regions are smaller and may have higher local variation
+    auto m=analyze_expression_fast(postfix,r.bounds_min,r.bounds_max,512,var_names);
 
-    // Quick classification for simple smooth regions
-    if (metrics.grad > 0 && metrics.var > 0) {
-        long double normalized_var = metrics.var / (metrics.avg * metrics.avg + 1e-10L);
-        long double grad_ratio = metrics.grad / (std::abs(metrics.avg) + 1e-10L);
-
-        if (normalized_var < 0.1 && grad_ratio < 1.5) {
-            if (verbose) {
-                std::cout << "\n[" << name << "] Simple smooth region detected -> FP16\n";
-                std::cout << "  Normalized Var: " << normalized_var << ", Grad Ratio: " << grad_ratio << "\n";
-            }
-            return Precision::Half;
-        }
-    }
-
-    const long double eps_half = 4.88e-4L; // FP16
-    const long double eps_float = std::numeric_limits<float>::epsilon();
-    const long double eps_double = std::numeric_limits<double>::epsilon();
-
-    long double max_val = std::max(std::abs(metrics.avg), std::sqrt(std::abs(metrics.var)));
-    max_val = std::max(max_val, 1e-10L);
-
-    long double normalized_grad = std::max(metrics.grad, 1.0L);
-
-    // Improved condition number with variance contribution
-    long double condition_number = normalized_grad * max_val / std::max(std::abs(metrics.avg), static_cast<long double>(tol));
-    condition_number += std::sqrt(metrics.var) / (std::abs(metrics.avg) + tol);
-    condition_number = std::max(condition_number, 1.0L);
-
-    // Adaptive operation count based on gradient complexity
-    long double operation_count = 10.0L + std::log10(condition_number + 1);
-
-    long double error_factor = max_val * condition_number * std::sqrt(operation_count);
-
-    long double error_half = eps_half * error_factor;
-    long double error_float = eps_float * error_factor;
-    long double error_double = eps_double * error_factor;
-
-    // Monte Carlo contribution with variance scaling
-    long double mc_error_scale = std::sqrt(metrics.var) / (std::abs(metrics.avg) + 1e-10L);
-
-    long double total_error_half = error_half * (1.0L + mc_error_scale);
-    long double total_error_float = error_float * (1.0L + mc_error_scale);
-    long double total_error_double = error_double * (1.0L + mc_error_scale);
-
-    if (verbose) {
-        std::cout << "\n=== Region Precision Analysis: " << name << " ===\n";
-        std::cout << "  Avg: " << metrics.avg << ", Var: " << metrics.var << ", Grad: " << metrics.grad << "\n";
-        std::cout << "  Condition: " << condition_number << ", Op Count: " << operation_count << "\n";
-        std::cout << "  Half error:  " << total_error_half << "\n";
-        std::cout << "  Float error: " << total_error_float << "\n";
-        std::cout << "  Double:   " << total_error_double << "\n";
-        std::cout << "  Tolerance:    " << tol << "\n";
-    }
-
-    double safety_factor = 5.0;
-
-    if (total_error_half <= tol / safety_factor) {
-        if (verbose) std::cout << "  -> Selected: FP16\n";
-        return Precision::Half;
-    }
-    if (total_error_float <= tol / safety_factor) {
-        if (verbose) std::cout << "  -> Selected: FP32\n";
-        return Precision::Float;
-    }
-
-    if (verbose) std::cout << "  -> Selected: FP64\n";
-    return Precision::Double;
+    // Regions need STRICTER tolerance (tol * 0.1) because:
+    // 1. They are subdomains that will be summed together
+    // 2. Error accumulation across many regions requires tighter per-region control
+    // 3. Adaptive refinement splits high-error regions, so we need accurate local estimates
+    return select_precision_fast(m, tol * 0.1, name, false);
 }
+inline std::vector<Region> adaptive_partition_nd(
+    const std::vector<Token>& postfix,
+    const Region& initial_region,
+    double variance_threshold,
+    double gradient_threshold,
+    size_t max_regions,
+    const std::vector<std::string>* var_names = nullptr)
+{
+    struct Item {
+        Region region;
+        long double score;
+    };
 
-#endif // PRECISION_H
+    auto cmp = [](const Item& a, const Item& b) {
+        return a.score < b.score;
+    };
+
+    std::priority_queue<Item, std::vector<Item>, decltype(cmp)> pq(cmp);
+
+    int dims = static_cast<int>(initial_region.bounds_min.size());
+
+    auto m0 = analyze_expression_fast(
+        postfix,
+        initial_region.bounds_min,
+        initial_region.bounds_max,
+        96,
+        var_names
+    );
+
+    // Better scoring: prioritize high variance AND high gradient regions
+    long double s0 = (m0.var + 1e-12L) * (m0.grad + 1.0L);
+
+    pq.push({initial_region, s0});
+
+    std::vector<Region> result;
+
+    // Continue splitting while we have budget
+    while (!pq.empty() && result.size() + pq.size() < max_regions) {
+        Item top = pq.top();
+        pq.pop();
+
+        // Split if score is significant OR we haven't reached minimum regions
+        if (top.score < 1e-9L || (result.size() >= 16 && top.score < s0 * 0.01L)) {
+            result.push_back(top.region);
+            continue;
+        }
+
+        const Region& r = top.region;
+
+        int split_dim = 0;
+        double max_extent = r.bounds_max[0] - r.bounds_min[0];
+        for (int d = 1; d < dims; ++d) {
+            double e = r.bounds_max[d] - r.bounds_min[d];
+            if (e > max_extent) {
+                max_extent = e;
+                split_dim = d;
+            }
+        }
+
+        if (max_extent < 1e-12) {
+            result.push_back(r);
+            continue;
+        }
+
+        double mid = 0.5 * (r.bounds_min[split_dim] + r.bounds_max[split_dim]);
+
+        Region r1 = r;
+        Region r2 = r;
+        r1.bounds_max[split_dim] = mid;
+        r2.bounds_min[split_dim] = mid;
+
+        auto m1 = analyze_expression_fast(
+            postfix, r1.bounds_min, r1.bounds_max, 64, var_names);
+        auto m2 = analyze_expression_fast(
+            postfix, r2.bounds_min, r2.bounds_max, 64, var_names);
+
+        // Same scoring as initial
+        long double s1 = (m1.var + 1e-12L) * (m1.grad + 1.0L);
+        long double s2 = (m2.var + 1e-12L) * (m2.grad + 1.0L);
+
+        pq.push({r1, s1});
+        pq.push({r2, s2});
+    }
+
+    while (!pq.empty() && result.size() < max_regions) {
+        result.push_back(pq.top().region);
+        pq.pop();
+    }
+
+    return result;
+}
+#endif
