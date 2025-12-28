@@ -7,10 +7,10 @@ CXX = g++
 #   sm_86: RTX 3070/3080/3090, A6000
 #   sm_89: RTX 4050/4060/4070/4080/4090, L40
 #   sm_90: H100
-CUDA_ARCH = sm_89
+
 
 # Compiler flags - OPTIMIZED
-NVCC_FLAGS = -arch=$(CUDA_ARCH) -O3 --use_fast_math \
+NVCC_FLAGS = -O3 --use_fast_math \
              -Xcompiler -fopenmp -Xcompiler -march=native \
              --ptxas-options=-v \
              -lineinfo \
@@ -61,7 +61,7 @@ device-info:
 	nvidia-smi
 	@echo ""
 	@echo "Detailed device information:"
-	@$(NVCC) -arch=$(CUDA_ARCH) --run cuda_device_query.cu 2>/dev/null || echo "Build device query tool with: nvcc -o device_query cuda_device_query.cu && ./device_query"
+	@$(NVCC) --run cuda_device_query.cu 2>/dev/null || echo "Build device query tool with: nvcc -o device_query cuda_device_query.cu && ./device_query"
 
 # Profile with Nsight Compute (requires appropriate permissions)
 profile: $(TARGET)
@@ -72,7 +72,7 @@ profile-sys: $(TARGET)
 	nsys profile --stats=true -o profile_timeline ./$(TARGET)
 
 # Build with debug symbols
-debug: NVCC_FLAGS = -arch=$(CUDA_ARCH) -G -g -O0 -Xcompiler -fopenmp
+debug: NVCC_FLAGS = -G -g -O0 -Xcompiler -fopenmp
 debug: clean $(TARGET)
 
 # Benchmark mode - disable all printing
@@ -90,7 +90,7 @@ check:
 
 # Generate PTX for inspection
 ptx: cuda_integration.cu
-	$(NVCC) -arch=$(CUDA_ARCH) -ptx cuda_integration.cu -o cuda_integration.ptx
+	$(NVCC) -ptx cuda_integration.cu -o cuda_integration.ptx
 
 # Phony targets
 .PHONY: all clean run device-info profile profile-sys debug benchmark check ptx
@@ -109,7 +109,3 @@ help:
 	@echo "  check        - Check CUDA installation"
 	@echo "  ptx          - Generate PTX assembly for inspection"
 	@echo ""
-	@echo "Adjust CUDA_ARCH in Makefile for your GPU:"
-	@echo "  RTX 3070/3080/3090: sm_86"
-	@echo "  RTX 4070/4080/4090: sm_89"
-	@echo "  H100: sm_90"

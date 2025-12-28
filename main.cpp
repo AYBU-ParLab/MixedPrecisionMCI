@@ -185,25 +185,7 @@ void compare_speedups(double t16, double t32, double t64) {
 // MAIN PROGRAM
 // ============================================================================
 
-static std::vector<std::string> extract_variables(const std::string &expr) {
-    static const std::set<std::string> funcs = {
-        "sin","cos","tan","asin","acos","atan",
-        "sinh","cosh","tanh","log","log10","exp",
-        "sqrt","pow","abs","min","max","ln"
-    };
-    std::vector<std::string> vars;
-    std::set<std::string> seen;
-    // Use regex to find all identifiers in order of appearance
-    std::regex re("([A-Za-z_]\\w*)");
-    for (auto it = std::sregex_iterator(expr.begin(), expr.end(), re); it != std::sregex_iterator(); ++it) {
-        std::string tok = (*it)[1].str();
-        if (funcs.count(tok)) continue;
-        if (tok == "pi" || tok == "e") continue;
-        // Add in order of first appearance (NO SORTING!)
-        if (seen.insert(tok).second) vars.push_back(tok);
-    }
-    return vars;
-}
+
 
 static std::vector<double> parse_comma_doubles(const std::string &s) {
     std::vector<double> out;
