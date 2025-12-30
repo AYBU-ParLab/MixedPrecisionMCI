@@ -168,53 +168,16 @@ inline StatisticalMetrics analyze_expression_fast(
     return m;
 }
 
-inline Precision select_precision_fast(
-    const StatisticalMetrics& m,
-    double tol,
-    const std::string&,
-    bool)
-{
-    // Constants are always Half precision
-    if (m.var==0 && m.grad==0) return Precision::Half;
+inline int count_operations(const std::vector<Token>& postfix) {
+    return static_cast<int>(postfix.size());
+}
 
-    long double eps16=4.88e-4L;
-    long double eps32=1.19e-7L;  // float epsilon
-    long double eps64=2.22e-16L; // double epsilon
-
-    // Estimate typical function value magnitude
-    long double scale = std::max(std::abs(m.avg), std::sqrt(std::abs(m.var)));
-    scale = std::max(scale, m.range * 0.5L);
-    scale = std::max(scale, 1e-12L);
-
-    // Proper condition number based on gradient (sensitivity to input perturbations)
-    // For integration: relative gradient scaled by typical domain size
-    long double typical_input_scale = 1.0L; // Assuming normalized domain ~O(1)
-    long double relative_gradient = (m.grad * typical_input_scale) / (scale + 1e-12L);
-    long double cond = std::max(1.0L, relative_gradient);
-
-    // Monte Carlo error per sample: ~sqrt(variance)
-    long double mc_error_per_sample = std::sqrt(std::abs(m.var));
-
-    // Rounding error estimates
-    long double rounding_err16 = eps16 * scale * cond;
-    long double rounding_err32 = eps32 * scale * cond;
-    long double rounding_err64 = eps64 * scale * cond;
-
-    // For Monte Carlo integration, we want rounding error << MC statistical error
-    // Use 1% threshold: if rounding error < 0.01 * MC_error, precision is sufficient
-    long double mc_threshold = mc_error_per_sample * 0.01L;
-
-    // Compare rounding errors to both MC error and user tolerance
-    if(rounding_err16 < mc_threshold && rounding_err16 < tol * 0.01L) {
-        return Precision::Half;
+inline bool has_risky_operations(const std::vector<Token>& postfix) {
+    for (const auto& t : postfix) {
+        if (t.type == TokenType::Operator && (t.value == "/" || t.value == "^")) return true;
+        if (t.type == TokenType::Function && (t.value == "ln" || t.value == "log" || t.value == "tan")) return true;
     }
-    if(rounding_err32 < mc_threshold && rounding_err32 < tol * 0.1L) {
-        return Precision::Float;
-    }
-    if(rounding_err64 < tol * 0.5L) {
-        return Precision::Double;
-    }
-    return Precision::LongDouble;
+    return false;
 }
 
 inline Precision select_precision_for_term(
@@ -222,29 +185,81 @@ inline Precision select_precision_for_term(
     const std::vector<double>& minb,
     const std::vector<double>& maxb,
     double tol,
-    const std::string& name,
+    const std::string&,
     const std::vector<std::string>* var_names = nullptr)
 {
-    auto m=analyze_expression_fast(postfix,minb,maxb,256,var_names);  // Increased for better stats
-    return select_precision_fast(m,tol,name,true);
+    int dims = static_cast<int>(minb.size());
+    int sample_count = (dims <= 4) ? 96 : (dims <= 7) ? 48 : 24;
+
+    auto m = analyze_expression_fast(postfix, minb, maxb, sample_count, var_names);
+
+    if (m.var == 0 && m.grad == 0) return Precision::Half;
+
+    int ops = count_operations(postfix);
+    bool has_risky = has_risky_operations(postfix);
+
+    long double scale = std::max(std::abs(m.avg), std::sqrt(std::abs(m.var)));
+    scale = std::max(scale, m.range * 0.5L);
+    scale = std::max(scale, 1e-12L);
+
+    long double cond = (m.grad * 1.0L) / (scale + 1e-12L);
+    cond = std::max(1.0L, cond);
+
+    if (has_risky) {
+        if (m.range > 100.0L || cond > 100.0L) return Precision::Double;
+        if (cond > 10.0L || ops > 20) return Precision::Float;
+    }
+
+    long double var_scale = std::sqrt(std::abs(m.var)) / (std::abs(m.avg) + 1e-12L);
+
+    if (var_scale > 1.0L || cond > 50.0L) return Precision::Double;
+    if (var_scale > 0.1L || cond > 5.0L || ops > 15) return Precision::Float;
+
+    return Precision::Half;
 }
 
 inline Precision select_precision_for_region(
     const std::vector<Token>& postfix,
     const Region& r,
     double tol,
-    const std::string& name,
+    const std::string&,
     const std::vector<std::string>* var_names = nullptr)
 {
-    // Use MORE samples for regions (512 vs 256 for terms) to get accurate variance/gradient estimates
-    // Regions are smaller and may have higher local variation
-    auto m=analyze_expression_fast(postfix,r.bounds_min,r.bounds_max,512,var_names);
+    int dims = static_cast<int>(r.bounds_min.size());
+    int sample_count = (dims <= 4) ? 48 : (dims <= 7) ? 24 : 12;
 
-    // Regions need STRICTER tolerance (tol * 0.1) because:
-    // 1. They are subdomains that will be summed together
-    // 2. Error accumulation across many regions requires tighter per-region control
-    // 3. Adaptive refinement splits high-error regions, so we need accurate local estimates
-    return select_precision_fast(m, tol * 0.1, name, false);
+    auto m = analyze_expression_fast(postfix, r.bounds_min, r.bounds_max, sample_count, var_names);
+
+    if (m.var == 0 && m.grad == 0) return Precision::Half;
+
+    int ops = count_operations(postfix);
+    bool has_risky = has_risky_operations(postfix);
+
+    long double scale = std::max(std::abs(m.avg), std::sqrt(std::abs(m.var)));
+    scale = std::max(scale, m.range * 0.5L);
+    scale = std::max(scale, 1e-12L);
+
+    long double cond = (m.grad * 1.0L) / (scale + 1e-12L);
+    cond = std::max(1.0L, cond);
+
+    long double cv = m.coefficient_of_variation;
+
+    // Very simple expressions (like "a", "a+b", "2*a+1") should use FP16
+    // Linear functions have low CV but not extremely low (uniform distribution CV ≈ 0.577)
+    if (ops <= 3 && !has_risky && cv < 1.5L && cond < 10.0L) {
+        return Precision::Half;
+    }
+
+    if (cv > 2.0L || cond > 200.0L) return Precision::Double;
+    if (cv > 0.5L || cond > 20.0L) return Precision::Float;
+
+    long double local_var = std::sqrt(std::abs(m.var));
+    long double rel_error = local_var / (std::abs(m.avg) + 1e-12L);
+
+    if (rel_error > 0.5L || m.range > 50.0L) return Precision::Double;
+    if (rel_error > 0.05L || m.grad > 10.0L) return Precision::Float;
+
+    return Precision::Half;
 }
 inline std::vector<Region> adaptive_partition_nd(
     const std::vector<Token>& postfix,
@@ -266,29 +281,51 @@ inline std::vector<Region> adaptive_partition_nd(
     std::priority_queue<Item, std::vector<Item>, decltype(cmp)> pq(cmp);
 
     int dims = static_cast<int>(initial_region.bounds_min.size());
+    int anal_samples = (dims <= 4) ? 64 : (dims <= 7) ? 32 : 16;
 
     auto m0 = analyze_expression_fast(
         postfix,
         initial_region.bounds_min,
         initial_region.bounds_max,
-        96,
+        anal_samples,
         var_names
     );
 
-    // Better scoring: prioritize high variance AND high gradient regions
     long double s0 = (m0.var + 1e-12L) * (m0.grad + 1.0L);
 
     pq.push({initial_region, s0});
 
     std::vector<Region> result;
 
-    // Continue splitting while we have budget
+    // For very simple functions (low variance AND low gradient variation), use minimal regions
+    // Check coefficient of variation: for linear functions like "a", CV is very low
+    // CV = stddev / mean. For uniform "a" on [0,1]: mean=0.5, stddev=0.289, CV=0.577
+    // But we're measuring sampling variance, not population variance
+    long double cv = m0.coefficient_of_variation;
+
+    // Linear functions have uniform behavior - single region is sufficient
+    // Use very low gradient (derivative exists but function is smooth everywhere)
+    if (cv < 1.5L && m0.grad < 5.0L) {
+        return {initial_region};  // Single region is sufficient for smooth linear functions
+    }
+
+    size_t min_regions = (dims <= 3) ? 4 : (dims <= 5) ? 8 : 16;
+    min_regions = std::min(min_regions, max_regions / 4);
+
+    // For very simple functions (low initial score), stop early
+    long double score_threshold = s0 * 0.001L;  // 0.1% of initial score
+    if (s0 < 1e-6L) {
+        // Extremely simple function, use single region
+        return {initial_region};
+    }
+
     while (!pq.empty() && result.size() + pq.size() < max_regions) {
         Item top = pq.top();
         pq.pop();
 
-        // Split if score is significant OR we haven't reached minimum regions
-        if (top.score < 1e-9L || (result.size() >= 16 && top.score < s0 * 0.01L)) {
+        // Stop if score is very low or significantly smaller than initial score
+        if (top.score < 1e-9L ||
+            (result.size() >= min_regions && top.score < score_threshold)) {
             result.push_back(top.region);
             continue;
         }
@@ -317,12 +354,14 @@ inline std::vector<Region> adaptive_partition_nd(
         r1.bounds_max[split_dim] = mid;
         r2.bounds_min[split_dim] = mid;
 
-        auto m1 = analyze_expression_fast(
-            postfix, r1.bounds_min, r1.bounds_max, 64, var_names);
-        auto m2 = analyze_expression_fast(
-            postfix, r2.bounds_min, r2.bounds_max, 64, var_names);
+        int split_samples = anal_samples / 2;
+        split_samples = std::max(split_samples, 8);
 
-        // Same scoring as initial
+        auto m1 = analyze_expression_fast(
+            postfix, r1.bounds_min, r1.bounds_max, split_samples, var_names);
+        auto m2 = analyze_expression_fast(
+            postfix, r2.bounds_min, r2.bounds_max, split_samples, var_names);
+
         long double s1 = (m1.var + 1e-12L) * (m1.grad + 1.0L);
         long double s2 = (m2.var + 1e-12L) * (m2.grad + 1.0L);
 

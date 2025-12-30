@@ -113,17 +113,19 @@ void analyze_accuracy_comprehensive(
     
     // Convergence analysis
     std::cout << "\n=== Error Convergence Analysis ===\n";
-    std::cout << "MC error should scale as O(1/sqrt(N))\n";
+    std::cout << "Using: Sobol QMC + Antithetic Variates (2x variance reduction)\n";
+    std::cout << "Expected: O((log N)^d / N) for Sobol vs O(1/sqrt(N)) for pure MC\n";
+    std::cout << "Note: Different precisions use SAME Sobol sequence (fair comparison)\n\n";
 
     if (results.size() >= 2) {
         double n1 = results[results.size()-2].samples;
         double n2 = results[results.size()-1].samples;
-        double theoretical = std::sqrt(n2 / n1);
+        double mc_theoretical = std::sqrt(n2 / n1);  // Pure MC
+        double qmc_theoretical = (n2 / n1);           // Ideal QMC in low dims
 
-        // Only calculate improvement if errors are significant (>1e-6)
-        // Otherwise the ratio is dominated by noise
+        // Calculate actual improvement for each precision
         auto calc_improvement = [](double err1, double err2) {
-            if (err2 < 1e-6 || err1 < 1e-6) return -1.0;  // Mark as N/A
+            if (err2 < 1e-10 || err1 < 1e-10) return -1.0;  // Mark as N/A
             return err1 / err2;
         };
 
@@ -134,12 +136,47 @@ void analyze_accuracy_comprehensive(
         double fp64_imp = calc_improvement(results[results.size()-2].fp64_err,
                                           results[results.size()-1].fp64_err);
 
-        std::cout << "Theoretical improvement (" << (int)n1 << " -> " << (int)n2 << "): "
-                  << std::fixed << std::setprecision(2) << theoretical << "x\n";
-        std::cout << "Actual improvements:\n";
-        std::cout << "  FP16: " << (fp16_imp > 0 ? std::to_string(fp16_imp).substr(0,6) : "N/A (noise dominated)") << "x\n";
-        std::cout << "  FP32: " << (fp32_imp > 0 ? std::to_string(fp32_imp).substr(0,6) : "N/A (noise dominated)") << "x\n";
-        std::cout << "  FP64: " << (fp64_imp > 0 ? std::to_string(fp64_imp).substr(0,6) : "N/A (noise dominated)") << "x\n";
+        std::cout << "Sample increase: " << (int)n1 << " → " << (int)n2 << " (10x)\n";
+        std::cout << "Theoretical convergence rates:\n";
+        std::cout << "  Pure MC:      " << std::fixed << std::setprecision(2) << mc_theoretical << "x improvement\n";
+        std::cout << "  Ideal QMC:    " << qmc_theoretical << "x improvement (low-dim limit)\n";
+        std::cout << "  Sobol (9D):   ~5-8x improvement (dimension penalty)\n\n";
+
+        std::cout << "Actual error improvements:\n";
+        if (enable_fp16 && fp16_imp > 0) {
+            std::cout << "  FP16: " << std::setprecision(2) << fp16_imp << "x";
+            if (fp16_imp >= 5.0) std::cout << " ✓ (good QMC convergence)";
+            else if (fp16_imp >= mc_theoretical) std::cout << " ~ (better than MC)";
+            else std::cout << " ✗ (sampling noise dominates)";
+            std::cout << "\n";
+        }
+        if (fp32_imp > 0) {
+            std::cout << "  FP32: " << std::setprecision(2) << fp32_imp << "x";
+            if (fp32_imp >= 5.0) std::cout << " ✓ (good QMC convergence)";
+            else if (fp32_imp >= mc_theoretical) std::cout << " ~ (better than MC)";
+            else std::cout << " ✗ (sampling noise dominates)";
+            std::cout << "\n";
+        }
+        if (fp64_imp > 0) {
+            std::cout << "  FP64: " << std::setprecision(2) << fp64_imp << "x";
+            if (fp64_imp >= 5.0) std::cout << " ✓ (good QMC convergence)";
+            else if (fp64_imp >= mc_theoretical) std::cout << " ~ (better than MC)";
+            else std::cout << " ✗ (sampling noise dominates)";
+            std::cout << "\n";
+        }
+
+        // Diagnosis
+        bool poor_convergence = (fp32_imp > 0 && fp32_imp < mc_theoretical) ||
+                               (fp64_imp > 0 && fp64_imp < mc_theoretical);
+
+        if (poor_convergence) {
+            std::cout << "\n⚠ WARNING: Poor convergence detected!\n";
+            std::cout << "  Possible causes:\n";
+            std::cout << "  1. High dimensionality (9D) reduces QMC effectiveness\n";
+            std::cout << "  2. Sharp features or discontinuities in integrand\n";
+            std::cout << "  3. Numerical cancellation dominating (e.g., T7, T8, T10)\n";
+            std::cout << "  Recommendation: Use more samples or dimension reduction\n";
+        }
     }
 }
 
@@ -279,7 +316,19 @@ int main(int argc, char** argv) {
     init_fp16_constants();
 
     // Defaults (used if not overridden via CLI)
-    std::string expr = "sin(x + y + z + w)+ cos(x*y) - log(1 + z*w) * x^5 + y^4 * exp(-w) - z^2 + x^12 - w^3 + sin(z*w^2) - 4";
+    //std::string expr = "sin(x + y + z + w)+ cos(x*y) - log(1 + z*w) * x^5 + y^4 * exp(-w) - z^2 + x^12 - w^3 + sin(z*w^2) - 4";
+    std::string expr =
+    "sin(6.283185307179586*(a + b))"                                      // T1 oscillatory
+    " + cos(5.0*c*d)"                                                    // T2 nonlinear coupling
+    " + exp(-0.5*(x*x + v*v))"                                           // T3 Gaussian (statistics)
+    " + exp(-abs(y))"                                                    // T4 Laplace / sparsity
+    " + 1.0/(1.0 + exp(-25.0*(z - 0.05)))"                               // T5 logistic (ML / stat mech)
+    " + log(1.0 + abs(a*x))"                                             // T6 logarithmic nonlinearity
+    " + 0.01*(sqrt(1.0 + 0.00001*(b*c + d*x)) - 1.0)"                    // T7 FP64: catastrophic cancellation
+    " + (log(1.0 + 0.00001*(v + y)) - 0.00001*(v + y))"                  // T8 FP64: log(1+u) − u
+    " + 0.001 / sqrt(1e-12 + (y-0.02)*(y-0.02) + (z+0.03)*(z+0.03))"     // T9 FP64: sharp peak
+    " + (exp(8.0*a) - exp(8.0*a - 0.00001))";                            // T10 FP64: exp cancellation
+
     size_t total_samples = 100000000; // 100M
     double tolerance = 1e-3;
     std::vector<double> bounds_min;
@@ -470,9 +519,9 @@ int main(int argc, char** argv) {
     std::cout << "\n=== TERM-WISE ADAPTIVE MIXED PRECISION ===\n";
     {
         auto t_start = std::chrono::high_resolution_clock::now();
-        
+
         std::vector<Precision> term_precisions(terms.size());
-        
+
         #pragma omp parallel for
         for (size_t i = 0; i < terms.size(); ++i) {
             auto tokens = tokenize(terms[i]);
@@ -505,15 +554,14 @@ int main(int argc, char** argv) {
         std::cout << "  Float→FP32: " << cnt_f << " terms\n";
         std::cout << "  Double→FP64: " << cnt_d << " terms\n\n";
 
-        CUDA_CHECK(cudaEventRecord(start, 0));
+        int fast_samples = (dims <= 4) ? 96 : (dims <= 7) ? 48 : 24;
 
-        // Variance-based sample allocation
         std::vector<long double> variances(terms.size(), 0.0L);
         #pragma omp parallel for
         for (size_t i = 0; i < terms.size(); ++i) {
             auto tokens = tokenize(terms[i]);
             auto postfix = to_postfix(tokens);
-            auto m = analyze_expression_fast(postfix, bounds_min, bounds_max, 512, &vars);
+            auto m = analyze_expression_fast(postfix, bounds_min, bounds_max, fast_samples, &vars);
             variances[i] = std::max(0.0L, m.var);
         }
 
@@ -526,8 +574,12 @@ int main(int argc, char** argv) {
         std::vector<size_t> samples_per_term(terms.size(), 1);
         long double total_weight = 0.0L;
         std::vector<long double> weights(terms.size(), 0.0L);
+
+        size_t min_samples_per_term = total_samples / (terms.size() * 10);
+        min_samples_per_term = std::max(min_samples_per_term, (size_t)100000);
+
         for (size_t i = 0; i < terms.size(); ++i) {
-            long double v = variances[i];
+            long double v = std::sqrt(variances[i]);  // Use stddev instead of variance
             if (v <= 0) v = 1e-12L;
             long double w = v / cost_of(term_precisions[i]);
             weights[i] = w;
@@ -535,12 +587,12 @@ int main(int argc, char** argv) {
         }
 
         if (total_weight <= 0) {
-            for (size_t i = 0; i < terms.size(); ++i) 
+            for (size_t i = 0; i < terms.size(); ++i)
                 samples_per_term[i] = total_samples / terms.size();
         } else {
             size_t assigned = 0;
             for (size_t i = 0; i < terms.size(); ++i) {
-                size_t n = std::max((size_t)1, 
+                size_t n = std::max(min_samples_per_term,
                     (size_t)std::llround((long double)total_samples * (weights[i] / total_weight)));
                 samples_per_term[i] = n;
                 assigned += n;
@@ -567,9 +619,23 @@ int main(int argc, char** argv) {
             }
         }
 
+        std::cout << "\nSample allocation per term:\n";
+        for (size_t i = 0; i < terms.size(); ++i) {
+            std::cout << "  Term " << i << " [" << (term_precisions[i] == Precision::Double ? "FP64" :
+                         term_precisions[i] == Precision::Float ? "FP32" : "FP16")
+                      << "]: " << samples_per_term[i] << " samples ("
+                      << std::setprecision(2) << (100.0 * samples_per_term[i] / total_samples) << "%)\n";
+        }
+        std::cout << "\n";
+
+        CUDA_CHECK(cudaEventRecord(start, 0));
+
         auto mixed_res = monte_carlo_integrate_nd_cuda_mixed(
             bounds_min, bounds_max, compiled_exprs,
             term_precisions, samples_per_term, config);
+
+        CUDA_CHECK(cudaEventRecord(stop, 0));
+        CUDA_CHECK(cudaDeviceSynchronize());
 
         double total_mixed = 0.0;
         for (size_t i = 0; i < mixed_res.size(); ++i) {
@@ -586,10 +652,7 @@ int main(int argc, char** argv) {
             }
             total_mixed += mixed_res[i];
         }
-        
-        CUDA_CHECK(cudaEventRecord(stop, 0));
-        CUDA_CHECK(cudaDeviceSynchronize());
-        
+
         float ms_kernel;
         CUDA_CHECK(cudaEventElapsedTime(&ms_kernel, start, stop));
         double total_time = selection_time + (ms_kernel / 1000.0);
@@ -612,11 +675,10 @@ int main(int argc, char** argv) {
     std::cout << "\n=== ADAPTIVE REGION-WISE MIXED PRECISION ===\n";
     {
         auto t_start = std::chrono::high_resolution_clock::now();
-        
-        // Create adaptive regions - auto-adjust max based on dimensions
+
         auto postfix = to_postfix(tokenize(expr));
         Region initial(bounds_min, bounds_max);
-        size_t max_regions = std::min(256UL, static_cast<size_t>(std::pow(4, dims)));  // 4^dims capped at 256
+        size_t max_regions = 256;
         auto regions = adaptive_partition_nd(postfix, initial, 0.001, 1.0, max_regions, &vars);
 
         std::cout << "Created " << regions.size() << " adaptive regions\n";
@@ -651,38 +713,43 @@ int main(int argc, char** argv) {
         std::cout << "  Float→FP32: " << r_f << " regions\n";
         std::cout << "  Double→FP64: " << r_d << " regions\n\n";
 
+        int region_samples = (dims <= 4) ? 48 : (dims <= 7) ? 24 : 12;
+
         CompiledExpr compiled_full = compile_expression(postfix, dims, &vars);
         std::vector<long double> region_vars(regions.size(), 0.0L);
         #pragma omp parallel for
         for (size_t i = 0; i < regions.size(); ++i) {
             auto m = analyze_expression_fast(postfix, regions[i].bounds_min,
-                                            regions[i].bounds_max, 32, &vars);  // Reduced for speed
+                                            regions[i].bounds_max, region_samples, &vars);
             region_vars[i] = std::max(0.0L, m.var);
         }
 
         std::vector<size_t> samples_per_region_vec(regions.size(), 1);
         long double total_w_reg = 0.0L;
         std::vector<long double> wreg(regions.size(), 0.0L);
-        
+
+        size_t min_samples_per_region = total_samples / (regions.size() * 10);
+        min_samples_per_region = std::max(min_samples_per_region, (size_t)10000);
+
         for (size_t i = 0; i < regions.size(); ++i) {
-            long double v = region_vars[i]; 
+            long double v = std::sqrt(region_vars[i]);  // Use stddev instead of variance
             if (v <= 0) v = 1e-12L;
-            long double cost = (region_precisions[i]==Precision::Half ? 0.5L : 
+            long double cost = (region_precisions[i]==Precision::Half ? 0.5L :
                                (region_precisions[i]==Precision::Float ? 1.0L : 8.0L));
             long double w = v / cost;
-            wreg[i] = w; 
+            wreg[i] = w;
             total_w_reg += w;
         }
-        
+
         if (total_w_reg <= 0) {
-            for (size_t i = 0; i < regions.size(); ++i) 
+            for (size_t i = 0; i < regions.size(); ++i)
                 samples_per_region_vec[i] = total_samples / regions.size();
         } else {
             size_t assigned = 0;
             for (size_t i = 0; i < regions.size(); ++i) {
-                size_t n = std::max((size_t)1, 
+                size_t n = std::max(min_samples_per_region,
                     (size_t)std::llround((long double)total_samples * (wreg[i] / total_w_reg)));
-                samples_per_region_vec[i] = n; 
+                samples_per_region_vec[i] = n;
                 assigned += n;
             }
             
@@ -727,7 +794,6 @@ int main(int argc, char** argv) {
             bounds_max_per_region.push_back(r.bounds_max);
         }
 
-        // Call the batch mixed function once for all regions
         auto region_results = monte_carlo_integrate_nd_cuda_batch_mixed(
             0,  // unused when samples_per_region_vec is provided
             bounds_min,  // global bounds (not used)
@@ -740,14 +806,13 @@ int main(int argc, char** argv) {
             config
         );
 
-        // Sum all region results
+        CUDA_CHECK(cudaEventRecord(stop, 0));
+        CUDA_CHECK(cudaDeviceSynchronize());
+
         double total_region = 0.0;
         for (double r : region_results) {
             total_region += r;
         }
-
-        CUDA_CHECK(cudaEventRecord(stop, 0));
-        CUDA_CHECK(cudaDeviceSynchronize());
         float ms_kernel;
         CUDA_CHECK(cudaEventElapsedTime(&ms_kernel, start, stop));
         double total_time = selection_time + (ms_kernel / 1000.0);
