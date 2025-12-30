@@ -220,47 +220,28 @@ inline Precision select_precision_for_term(
 
 inline Precision select_precision_for_region(
     const std::vector<Token>& postfix,
-    const Region& r,
-    double tol,
-    const std::string&,
-    const std::vector<std::string>* var_names = nullptr)
+    const Region& region,
+    double tolerance,
+    const std::string& name,
+    const std::vector<std::string>* var_names)
 {
-    int dims = static_cast<int>(r.bounds_min.size());
-    int sample_count = (dims <= 4) ? 48 : (dims <= 7) ? 24 : 12;
-
-    auto m = analyze_expression_fast(postfix, r.bounds_min, r.bounds_max, sample_count, var_names);
-
-    if (m.var == 0 && m.grad == 0) return Precision::Half;
-
+    auto m = analyze_expression_fast(postfix, region.bounds_min, region.bounds_max, 48, var_names);
+    
     int ops = count_operations(postfix);
     bool has_risky = has_risky_operations(postfix);
-
-    long double scale = std::max(std::abs(m.avg), std::sqrt(std::abs(m.var)));
-    scale = std::max(scale, m.range * 0.5L);
-    scale = std::max(scale, 1e-12L);
-
-    long double cond = (m.grad * 1.0L) / (scale + 1e-12L);
-    cond = std::max(1.0L, cond);
-
-    long double cv = m.coefficient_of_variation;
-
-    // Very simple expressions (like "a", "a+b", "2*a+1") should use FP16
-    // Linear functions have low CV but not extremely low (uniform distribution CV ≈ 0.577)
-    if (ops <= 3 && !has_risky && cv < 1.5L && cond < 10.0L) {
-        return Precision::Half;
-    }
-
-    if (cv > 2.0L || cond > 200.0L) return Precision::Double;
-    if (cv > 0.5L || cond > 20.0L) return Precision::Float;
-
-    long double local_var = std::sqrt(std::abs(m.var));
-    long double rel_error = local_var / (std::abs(m.avg) + 1e-12L);
-
-    if (rel_error > 0.5L || m.range > 50.0L) return Precision::Double;
-    if (rel_error > 0.05L || m.grad > 10.0L) return Precision::Float;
-
+    
+    // CRITICAL: Use coefficient of variation - it's scale-invariant!
+    long double cv = m.coefficient_of_variation;  // This is already computed!
+    
+    // High CV = unstable = needs FP64
+    if (has_risky && cv > 0.1L) return Precision::Double;
+    
+    if (cv > 0.5L || m.grad > 10.0L) return Precision::Double;
+    if (cv > 0.1L || m.grad > 2.0L || ops > 20) return Precision::Float;
+    
     return Precision::Half;
 }
+
 inline std::vector<Region> adaptive_partition_nd(
     const std::vector<Token>& postfix,
     const Region& initial_region,
