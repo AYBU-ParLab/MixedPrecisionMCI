@@ -234,10 +234,10 @@ inline Precision select_precision_for_region(
     long double cv = m.coefficient_of_variation;  // This is already computed!
     
     // High CV = unstable = needs FP64
-    if (has_risky && cv > 0.1L) return Precision::Double;
+    if (has_risky && cv > 0.3L) return Precision::Double;
     
     if (cv > 0.5L || m.grad > 10.0L) return Precision::Double;
-    if (cv > 0.1L || m.grad > 2.0L || ops > 20) return Precision::Float;
+    if (cv > 0.3L || m.grad > 2.0L || ops > 20) return Precision::Float;
     
     return Precision::Half;
 }
