@@ -326,7 +326,7 @@ int main(int argc, char** argv) {
     " + log(1.0 + abs(a*x))"                                             // T6 logarithmic nonlinearity
     " + 0.01*(sqrt(1.0 + 0.00001*(b*c + d*x)) - 1.0)"                    // T7 FP64: catastrophic cancellation
     " + (log(1.0 + 0.00001*(v + y)) - 0.00001*(v + y))"                  // T8 FP64: log(1+u) − u
-    " + 0.001 / sqrt(1e-12 + (y-0.02)*(y-0.02) + (z+0.03)*(z+0.03))"     // T9 FP64: sharp peak
+    " + 0.001 / sqrt(0.000000000001 + (y-0.02)*(y-0.02) + (z+0.03)*(z+0.03))"     // T9 FP64: sharp peak
     " + (exp(8.0*a) - exp(8.0*a - 0.00001))";                            // T10 FP64: exp cancellation
 
     size_t total_samples = 100000000; // 100M
